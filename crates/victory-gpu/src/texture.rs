@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
+use victory_host::Recorder as _;
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
@@ -150,7 +151,7 @@ impl StagedCopy {
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
             };
             // SAFETY: an open list and live resources in their copy states.
-            unsafe { list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+            unsafe { crate::backend::rec(&list).copy_texture(crate::backend::location_of(&dst), [0, 0, 0], crate::backend::location_of(&src), None) };
         }
     }
 }
@@ -371,7 +372,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             D3D12_RESOURCE_STATES(state as i32),
         );
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::backend::record_barriers(&list.list, &[barrier]) };
         before
     });
     if !first && before.is_none() {
@@ -404,20 +405,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+        crate::backend::record_barriers(&list.list, &[crate::host::transition(&through.buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
+            crate::backend::rec(&list.list).copy_texture(crate::backend::location_of(&rows(of_written)), [0, 0, 0], crate::backend::location_of(&part(from, index)), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+        crate::backend::record_barriers(&list.list, &[crate::host::transition(&through.buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
-            list.list
-                .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
+            crate::backend::rec(&list.list).copy_texture(crate::backend::location_of(&part(to, index)), [0, 0, 0], crate::backend::location_of(&rows(of_read)), None);
         }
-        list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+        crate::backend::record_barriers(&list.list, &[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
     // A draw that also writes the source (a view of it handled before
@@ -830,7 +826,7 @@ fn upload_texture(list: &HostList, resource: This, texture: &ID3D12Resource, fir
             },
         };
         // SAFETY: an open list; both locations name live resources.
-        unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { crate::backend::rec(&list.list).copy_texture(crate::backend::location_of(&to), [0, 0, 0], crate::backend::location_of(&from), None) };
     }
     // The copy reads the bytes refreshed for this submission. Recording
     // its upload after the refresh lets subsequent lists reuse those bytes.

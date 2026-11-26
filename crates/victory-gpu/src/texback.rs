@@ -20,6 +20,7 @@
 //! before, as it would before the console's GPU has run.
 
 use std::sync::OnceLock;
+use victory_host::Recorder as _;
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -155,7 +156,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, retained: crate::resource
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: i as u32 },
         };
         // SAFETY: an open list; the texture is in the copy-source state.
-        unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        unsafe { crate::backend::rec(&list).copy_texture(crate::backend::location_of(&to), [0, 0, 0], crate::backend::location_of(&from), None) };
     }
     COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let kind = crate::resource::texture_kind(resource);

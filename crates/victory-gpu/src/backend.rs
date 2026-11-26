@@ -193,6 +193,67 @@ fn location(l: &Location<'_, ID3D12Resource>) -> D3D12_TEXTURE_COPY_LOCATION {
     }
 }
 
+/// The seam's barrier for a D3D12 one (callers that still build D3D12's).
+fn barrier_of(b: &D3D12_RESOURCE_BARRIER) -> Barrier<'_, ID3D12Resource> {
+    // SAFETY: each arm reads the union member its Type names.
+    unsafe {
+        match b.Type {
+            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION => {
+                let t = &b.Anonymous.Transition;
+                match t.pResource.as_ref() {
+                    Some(resource) => Barrier::Transition {
+                        resource,
+                        subresource: t.Subresource,
+                        before: t.StateBefore.0 as u32,
+                        after: t.StateAfter.0 as u32,
+                    },
+                    None => Barrier::Unordered(None),
+                }
+            }
+            D3D12_RESOURCE_BARRIER_TYPE_ALIASING => {
+                let a = &b.Anonymous.Aliasing;
+                Barrier::Aliasing(a.pResourceBefore.as_ref(), a.pResourceAfter.as_ref())
+            }
+            _ => Barrier::Unordered(b.Anonymous.UAV.pResource.as_ref()),
+        }
+    }
+}
+
+/// Records D3D12-built barriers through the seam, 16 at a time on the
+/// stack (no allocation).
+///
+/// # Safety
+/// As for [`Recorder::barriers`].
+pub(crate) unsafe fn record_barriers(list: &ID3D12GraphicsCommandList, barriers: &[D3D12_RESOURCE_BARRIER]) {
+    let rec = D3d12List(list);
+    for chunk in barriers.chunks(16) {
+        let mut seam = [Barrier::Unordered(None); 16];
+        for (to, from) in seam.iter_mut().zip(chunk) {
+            *to = barrier_of(from);
+        }
+        // SAFETY: the caller's list and resources.
+        unsafe { rec.barriers(&seam[..chunk.len()]) };
+    }
+}
+
+/// The seam's copy location for a D3D12 one.
+pub(crate) fn location_of(l: &D3D12_TEXTURE_COPY_LOCATION) -> Location<'_, ID3D12Resource> {
+    let r = l.pResource.as_ref().expect("a copy location names its resource");
+    // SAFETY: each arm reads the union member its Type names.
+    unsafe {
+        if l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT {
+            Location::Footprint(r, *footprint(&l.Anonymous.PlacedFootprint))
+        } else {
+            Location::Subresource(r, l.Anonymous.SubresourceIndex)
+        }
+    }
+}
+
+/// The recorder for a D3D12 list.
+pub(crate) fn rec(list: &ID3D12GraphicsCommandList) -> D3d12List<'_> {
+    D3d12List(list)
+}
+
 /// A D3D12 command list seen through the host seam.
 #[derive(Clone, Copy)]
 pub(crate) struct D3d12List<'a>(pub(crate) &'a ID3D12GraphicsCommandList);

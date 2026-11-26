@@ -270,7 +270,7 @@ pub struct Region {
 }
 
 /// One end of a texture copy.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Location<'a, R> {
     /// Subresource `index` of a texture (mip + slice * mips + plane * ...).
     Subresource(&'a R, u32),
@@ -282,7 +282,7 @@ pub enum Location<'a, R> {
 pub const ALL_SUBRESOURCES: u32 = u32::MAX;
 
 /// An ordering point between commands of one list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum Barrier<'a, R> {
     /// `resource` (or one subresource) moves from state `before` to `after`
     /// (D3D12 numbering). Backends that track hazards themselves (Metal)
@@ -299,6 +299,20 @@ pub enum Barrier<'a, R> {
     /// `after` starts using memory `before` used (placed resources).
     Aliasing(Option<&'a R>, Option<&'a R>),
 }
+
+// Both hold only references: copyable whatever the resource type is.
+impl<R> Clone for Location<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for Location<'_, R> {}
+impl<R> Clone for Barrier<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for Barrier<'_, R> {}
 
 /// Recording into one open command list (slice 2a: barriers and copies).
 /// Methods are unsafe: the caller keeps the list open and every resource

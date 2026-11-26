@@ -23,7 +23,8 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 
 ## Still direct D3D12 in victory-gpu
 
-- the remaining ~70 barriers and ~50 copies across host.rs / texture.rs / resource.rs / list.rs (helpers exist now: swap `ResourceBarrier`/`Copy*` for `D3d12List(list).…`); `HostList` itself still holds an `ID3D12GraphicsCommandList`
+- barriers + copies: all production ones go through `Recorder` now (`record_barriers`, `rec(list).copy_*`, with `barrier_of` / `location_of` converting D3D12-built structs). Left direct: diagnostics (`capture.rs`), probes + test helpers (`memory/*`), GPU tests. Next cleanup: build `Barrier`/`Location` at the call sites instead of converting.
+- `HostList` itself still holds an `ID3D12GraphicsCommandList`; draws / dispatch / root bindings / clears still direct (2b, after slice 3)
 - copy footprints with layouts in `texture.rs`, `texback.rs` (use `copy_layout`)
 - title-memory heaps (`inplace.rs`, OpenExistingHeapFromAddress) — Metal analogue: `newBufferWithBytesNoCopy` on page-aligned title memory. Big one for VRAM.
 - `CheckFeatureSupport` calls
@@ -31,7 +32,7 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 
 ## Next slices
 
-2. command recording: rest of barriers/copies (2a mechanics done), then 2b: lists themselves (`HostList` over `Recorder`), draws/dispatch, root bindings, clears
+2. ~~2a barriers/copies~~ done. **Order from here: slice 3 before 2b** — Metal can't record a draw or dispatch without a pipeline, so pipelines + root signatures come first.
 3. pipelines + root signatures (MSC root signature → top-level argument buffer), tile mapping for sparse
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
 5. present (CAMetalLayer via winemac.drv's view) + MetalFX instead of FSR

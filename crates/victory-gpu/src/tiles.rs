@@ -54,7 +54,7 @@ pub(crate) fn activate(list: &ID3D12GraphicsCommandList, texture: &ID3D12Resourc
         },
     };
     // SAFETY: a live texture and a recording command list.
-    unsafe { list.ResourceBarrier(&[barrier]) };
+    unsafe { crate::backend::record_barriers(&list, &[barrier]) };
 }
 
 #[derive(Clone, Copy)]

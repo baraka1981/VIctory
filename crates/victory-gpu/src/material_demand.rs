@@ -13,6 +13,7 @@ use crate::descriptor::{
 };
 use crate::host::HostList;
 use windows::Win32::Graphics::Direct3D12::D3D12_RANGE;
+use victory_host::Recorder as _;
 
 const LIMIT: usize = 8;
 const MAX_AGE: u64 = 4;
@@ -234,8 +235,7 @@ pub(crate) fn record(
     // Like the title's indirect-record reads, its buffer promotes to COPY_SOURCE.
     // Both resources survive command execution and the completion callback.
     unsafe {
-        list.list
-            .CopyBufferRegion(&back, 0, &source.buffer, source.offset(at), bytes as u64);
+        crate::backend::rec(&list.list).copy_buffer(&back, 0, &source.buffer, source.offset(at), bytes as u64);
     }
     list.keep(&back);
     list.keep(&source.buffer);

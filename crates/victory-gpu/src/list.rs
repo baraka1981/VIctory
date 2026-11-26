@@ -11,6 +11,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::mem::offset_of;
+use victory_host::Recorder as _;
 
 use crate::object::{
     self, ALLOCATOR, E_INVALIDARG, HRESULT, Iid, LIST, Object, S_OK, Table, This, guid,
@@ -774,7 +775,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
                 )
             };
             // SAFETY: an open list and live resources.
-            unsafe { list.list.ResourceBarrier(host) };
+            unsafe { crate::backend::record_barriers(&list.list, host) };
         }
     }
     0
@@ -788,7 +789,7 @@ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: 
         let state = crate::host::legal_state(texture, state);
         let barrier = crate::host::transition(texture, State(before as i32), State(state as i32));
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::backend::record_barriers(&list.list, &[barrier]) };
     }
 }
 
@@ -872,7 +873,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
-            unsafe { list.list.CopyResource(to, from) };
+            unsafe { crate::backend::rec(&list.list).copy_resource(&to, &from) };
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1031,14 +1032,7 @@ extern "system" fn copy_texture_region(
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
-            list.list.CopyTextureRegion(
-                (&raw const to_location).cast(),
-                x,
-                y,
-                z,
-                (&raw const from).cast(),
-                host_box,
-            )
+            crate::backend::rec(&list.list).copy_texture(crate::backend::location_of(&*(&raw const to_location).cast::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION>()), [x, y, z], crate::backend::location_of(&*(&raw const from).cast::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION>()), (host_box).map(|b| crate::backend::region(&*b)))
         };
     }
     #[cfg(not(windows))]
@@ -1102,8 +1096,7 @@ fn read_back(
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
     unsafe {
-        list.list
-            .CopyTextureRegion((&raw const to).cast(), 0, 0, 0, (&raw const from).cast(), host_box)
+        crate::backend::rec(&list.list).copy_texture(crate::backend::location_of(&*(&raw const to).cast::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION>()), [0, 0, 0], crate::backend::location_of(&*(&raw const from).cast::<windows::Win32::Graphics::Direct3D12::D3D12_TEXTURE_COPY_LOCATION>()), (host_box).map(|b| crate::backend::region(&*b)))
     };
     list.defer_read_back(buffer, data, [row as usize, rows as usize, pitch as usize], src.resource);
     Ok(())
@@ -1231,7 +1224,7 @@ extern "system" fn clear_rtv(
         unsafe {
             if let Some((_, before)) = list.transition(record.resource, RENDER_TARGET) {
                 use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATES as State;
-                list.list.ResourceBarrier(&[crate::host::transition(
+                crate::backend::record_barriers(&list.list, &[crate::host::transition(
                     texture,
                     State(before as i32),
                     State(RENDER_TARGET as i32),
@@ -1970,7 +1963,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
         // SAFETY: an open list.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
+        unsafe { crate::backend::record_barriers(&list.list, &[barrier]) };
     }
     #[cfg(not(windows))]
     let _ = (this, count);

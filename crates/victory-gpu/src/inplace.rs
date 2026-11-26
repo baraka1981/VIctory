@@ -39,6 +39,7 @@ use std::collections::BTreeMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use victory_host::Recorder as _;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -680,7 +681,7 @@ impl Rig {
     fn fetch(&mut self, resource: &ID3D12Resource, offset: u64, size: usize) -> windows::core::Result<Vec<u8>> {
         let back = self.committed(D3D12_HEAP_TYPE_READBACK, size as u64, D3D12_RESOURCE_STATE_COPY_DEST)?;
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(&back, 0, resource, offset, size as u64) })?;
+        self.run(|list| unsafe { crate::backend::rec(&list).copy_buffer(&back, 0, &resource, offset, size as u64) })?;
         let mut data = std::ptr::null_mut();
         // SAFETY: the mapping holds `size` bytes until unmapped.
         unsafe {
@@ -702,7 +703,7 @@ impl Rig {
             up.Unmap(0, None);
         }
         // SAFETY: two live buffers, the range inside both.
-        self.run(|list| unsafe { list.CopyBufferRegion(resource, offset, &up, 0, bytes.len() as u64) })
+        self.run(|list| unsafe { crate::backend::rec(&list).copy_buffer(&resource, offset, &up, 0, bytes.len() as u64) })
     }
 
     /// A compute shader stores, through a root unordered-access view at
@@ -747,7 +748,7 @@ impl Rig {
         for _ in 0..3 {
             let started = std::time::Instant::now();
             // SAFETY: two live buffers of `bytes` bytes or more.
-            self.run(|list| unsafe { list.CopyBufferRegion(&to, 0, from, 0, bytes) })?;
+            self.run(|list| unsafe { crate::backend::rec(&list).copy_buffer(&to, 0, &from, 0, bytes) })?;
             best = best.min(started.elapsed().as_secs_f64() * 1000.0);
         }
         Ok(best)

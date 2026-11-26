@@ -2364,7 +2364,7 @@ pub(crate) fn copy_fetch_runs<'a>(
         }
         // SAFETY: the original adjacent ranges lie inside the same live
         // source and destination, retained by the caller through its fence.
-        unsafe { list.CopyBufferRegion(destination, at, source, lo as u64, (hi - lo) as u64) };
+        unsafe { crate::backend::rec(&list).copy_buffer(&destination, at, &source, lo as u64, (hi - lo) as u64) };
         copies += 1;
     }
     CARD_FETCH_COPIES.fetch_add(copies, Ordering::Relaxed);
@@ -4317,7 +4317,7 @@ impl Host {
                             continue;
                         };
                         for &(a, b) in ranges {
-                            list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            crate::backend::rec(&list).copy_buffer(&shadow.buffer, a as u64, &staging, a as u64, (b - a) as u64);
                             crate::shadow::CARD_STATS[0].fetch_add((b - a) as u64, Ordering::Relaxed);
                         }
                         crate::shadow::CARD_STATS[1].fetch_add(ranges.len() as u64, Ordering::Relaxed);
@@ -4331,7 +4331,7 @@ impl Host {
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
                         if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
+                            crate::backend::record_barriers(&list, &[transition(
                                 &shadow.buffer,
                                 D3D12_RESOURCE_STATE_COPY_DEST,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
@@ -4428,7 +4428,7 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     // What the submission's shaders wrote, first.
-                    list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    crate::backend::record_barriers(&list, &[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
                         Anonymous: D3D12_RESOURCE_BARRIER_0 {
@@ -6112,7 +6112,7 @@ impl HostList {
                 D3D12_RESOURCE_STATES(wanted as i32),
             );
             // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            unsafe { crate::backend::record_barriers(&self.list, &[barrier]) };
         }
     }
 
@@ -8056,7 +8056,7 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
+            crate::backend::record_barriers(&list, &[
                 transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
                 transition(
                     &back,
@@ -8064,7 +8064,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            crate::backend::rec(&list).copy_resource(&back, &texture);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -8073,7 +8073,7 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
+            crate::backend::record_barriers(&list, &[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
                     &back,

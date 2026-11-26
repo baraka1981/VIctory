@@ -419,7 +419,7 @@ fn record_clamp_as(
     let skip = usize::from(!waits);
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
-        l.ResourceBarrier(&first[skip..]);
+        crate::backend::record_barriers(&l, &first[skip..]);
         if records > 0 {
             l.SetComputeRootSignature(&c.root);
             l.SetPipelineState(&c.pso);
@@ -430,7 +430,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        crate::backend::record_barriers(&l, &second[skip..]);
     }
     true
 }
@@ -444,7 +444,7 @@ pub(crate) fn done(list: &HostList, scratch: &ID3D12Resource) {
 fn done_on(list: &ID3D12GraphicsCommandList, scratch: &ID3D12Resource) {
     // SAFETY: an open list and a live scratch buffer in INDIRECT_ARGUMENT.
     unsafe {
-        list.ResourceBarrier(&[transition(
+        crate::backend::record_barriers(list, &[transition(
             scratch,
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
             D3D12_RESOURCE_STATE_COMMON,
