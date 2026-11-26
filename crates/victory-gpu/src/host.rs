@@ -24,6 +24,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
+use victory_host::{Descriptors, Device as _, Memory};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -668,20 +669,11 @@ fn create() -> windows::core::Result<Host> {
         })?;
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
-        let rtvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let rtv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        let dsvs: ID3D12DescriptorHeap =
-            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-                NumDescriptors: RTV_RING,
-                ..Default::default()
-            })?;
-        let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+        let gpu = crate::backend::D3d12(&device);
+        let rtvs = gpu.descriptor_heap(Descriptors::Targets, RTV_RING, false)?;
+        let rtv_size = gpu.descriptor_step(Descriptors::Targets);
+        let dsvs = gpu.descriptor_heap(Descriptors::Depth, RTV_RING, false)?;
+        let dsv_size = gpu.descriptor_step(Descriptors::Depth);
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
@@ -721,6 +713,11 @@ fn create() -> windows::core::Result<Host> {
 }
 
 impl Host {
+    /// The device through the host seam ([`victory_host::Device`]).
+    pub(crate) fn gpu(&self) -> crate::backend::D3d12<'_> {
+        crate::backend::D3d12(&self.device)
+    }
+
     /// Whether this device is on the software adapter (WARP or the basic render driver): asked of the adapter the
     /// device reports, not of a switch. Used by the tests that need a card.
     #[cfg(test)]
@@ -1183,22 +1180,13 @@ fn plane_pass() -> Option<&'static PlanePass> {
     static PASS: OnceLock<Option<PlanePass>> = OnceLock::new();
     PASS.get_or_init(|| {
         let host = host()?;
-        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        // SAFETY: plain heap creation and queries.
+        let views = host.gpu().descriptor_heap(Descriptors::Views, PLANE_VIEWS, true).ok()?;
+        // SAFETY: plain queries.
         unsafe {
-            let views: ID3D12DescriptorHeap = host
-                .device
-                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: PLANE_VIEWS,
-                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                    NodeMask: 0,
-                })
-                .ok()?;
             Some(PlanePass {
                 cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
                 gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
-                step: host.device.GetDescriptorHandleIncrementSize(kind),
+                step: host.gpu().descriptor_step(Descriptors::Views),
                 views,
                 next: AtomicU32::new(0),
                 made: Mutex::default(),
@@ -7492,37 +7480,9 @@ impl Host {
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_READBACK,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a read-back buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
+        let desc = victory_host::ResourceDesc::buffer(size.max(1), 0);
+        match self.gpu().committed(Memory::Readback, &desc, victory_host::state::COPY_DEST, None) {
+            Ok(buffer) => Some(buffer),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no read-back buffer");
                 None
@@ -7566,38 +7526,12 @@ impl Host {
     fn mapped_upload(&self, size: u64, kind: D3D12_HEAP_TYPE) -> windows::core::Result<(ID3D12Resource, *mut u8)> {
         MADE[0].fetch_add(1, Ordering::Relaxed);
         MADE[1].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: kind,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
+        let memory = crate::backend::memory(kind).ok_or_else(windows::core::Error::empty)?;
+        let desc = victory_host::ResourceDesc::buffer(size.max(1), 0);
+        let buffer = self.gpu().committed(memory, &desc, victory_host::state::GENERIC_READ, None)?;
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of an upload buffer.
+        // SAFETY: plain mapping of an upload buffer.
         unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut buffer,
-                )
-                ?;
-            let buffer = buffer.ok_or_else(windows::core::Error::empty)?;
             let no_reads = D3D12_RANGE { Begin: 0, End: 0 };
             let read_range = (kind == D3D12_HEAP_TYPE_GPU_UPLOAD).then_some(&raw const no_reads);
             buffer.Map(0, read_range, Some(&mut data))?;
@@ -8393,46 +8327,18 @@ impl Host {
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_CUSTOM,
-            CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-            MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
+        let desc = victory_host::ResourceDesc::buffer(size.max(1), victory_host::flags::UNORDERED_ACCESS);
         let mut data = std::ptr::null_mut();
-        // SAFETY: plain creation and mapping of a CPU-visible buffer.
-        let made = unsafe {
-            self.device
-                .CreateCommittedResource(
-                    &heap,
-                    D3D12_HEAP_FLAG_NONE,
-                    &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
-                    None,
-                    &mut buffer,
-                )
-                .and_then(|()| {
-                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    b.Map(0, None, Some(&mut data))
-                })
-        };
+        let made = self
+            .gpu()
+            .committed(Memory::Shared, &desc, victory_host::state::COMMON, None)
+            .and_then(|b| {
+                // SAFETY: plain mapping of a CPU-visible buffer.
+                unsafe { b.Map(0, None, Some(&mut data))? };
+                Ok(b)
+            });
         match made {
-            Ok(()) => Some((buffer?, data.cast())),
+            Ok(buffer) => Some((buffer, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
@@ -8445,38 +8351,9 @@ impl Host {
     pub(crate) fn uav_buffer(&self, size: u64) -> Option<ID3D12Resource> {
         MADE[4].fetch_add(1, Ordering::Relaxed);
         MADE[5].fetch_add(size, Ordering::Relaxed);
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-            ..Default::default()
-        };
-        let mut buffer: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a device-local buffer.
-        let made = unsafe {
-            self.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut buffer,
-            )
-        };
-        match made {
-            Ok(()) => buffer,
+        let desc = victory_host::ResourceDesc::buffer(size.max(1), victory_host::flags::UNORDERED_ACCESS);
+        match self.gpu().committed(Memory::Device, &desc, victory_host::state::COMMON, None) {
+            Ok(buffer) => Some(buffer),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no unordered-access buffer");
                 None

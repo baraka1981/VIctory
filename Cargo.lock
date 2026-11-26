@@ -699,6 +699,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "victory-formats",
+ "victory-host",
  "victory-pipeline",
  "victory-shader",
  "windows",
@@ -723,6 +724,10 @@ dependencies = [
  "windows-sys",
  "zlib-rs",
 ]
+
+[[package]]
+name = "victory-host"
+version = "0.1.0"
 
 [[package]]
 name = "victory-loader"

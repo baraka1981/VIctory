@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
+use victory_host::{Descriptors, Device as _};
 
 pub(crate) const FIRST_RAW_PAGE_SLOTS: u32 = 1024;
 
@@ -917,17 +918,8 @@ pub(crate) fn probe_view_limit() {
     ONCE.call_once(|| {
         let Some(host) = host() else { return };
         let fits = |count: u32| {
-            // SAFETY: plain heap creation; the heap is released at once.
-            let made: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            };
-            made.is_ok()
+            // The heap is released at once.
+            host.gpu().descriptor_heap(Descriptors::Views, count, true).is_ok()
         };
         let views = if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
@@ -965,16 +957,7 @@ impl HostHeap {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
         let make = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
-            // SAFETY: plain heap creation.
-            unsafe {
-                host.device
-                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                        Type: kind,
-                        NumDescriptors: count,
-                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                        NodeMask: 0,
-                    })
-            }
+            host.gpu().descriptor_heap(crate::backend::descriptors(kind), count, true)
         };
         let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
@@ -1018,7 +1001,7 @@ impl HostHeap {
         let (cpu, step) = unsafe {
             (
                 heap.GetCPUDescriptorHandleForHeapStart().ptr,
-                host.device.GetDescriptorHandleIncrementSize(kind),
+                host.gpu().descriptor_step(crate::backend::descriptors(kind)),
             )
         };
         tracing::debug!(count, sampler, "host descriptor heap");
@@ -1100,12 +1083,9 @@ impl HostHeap {
         let Some(host) = host() else { return Ok(()) };
         // SAFETY: plain heap creation and copies inside live heaps.
         unsafe {
-            let block: ID3D12DescriptorHeap =
-                host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                    Type: kind,
-                    NumDescriptors: NULL_BLOCK,
-                    ..Default::default()
-                })?;
+            let block = host
+                .gpu()
+                .descriptor_heap(crate::backend::descriptors(kind), NULL_BLOCK, false)?;
             let start = block.GetCPUDescriptorHandleForHeapStart();
             let at = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
                 ptr: start.ptr + (i * self.step) as usize,
@@ -3742,38 +3722,25 @@ fn magenta() -> Option<&'static ID3D12Resource> {
     static TEXTURE: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
     TEXTURE
         .get_or_init(|| {
-            let heap = D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_CUSTOM,
-                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
-                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
-                ..Default::default()
+            let desc = victory_host::ResourceDesc {
+                dimension: victory_host::dimension::TEXTURE_2D,
+                alignment: 0,
+                width: 1,
+                height: 1,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format: DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags: 0,
             };
-            let desc = D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                Width: 1,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                ..Default::default()
-            };
-            let mut texture: Option<ID3D12Resource> = None;
-            // SAFETY: valid descriptions and an out pointer; the texel is
-            // written while nothing reads the texture.
+            let texture = host()?
+                .gpu()
+                .committed(victory_host::Memory::Shared, &desc, victory_host::state::COMMON, None)
+                .ok()?;
+            // SAFETY: the texel is written while nothing reads the texture.
             unsafe {
-                host()?
-                    .device
-                    .CreateCommittedResource(
-                        &heap,
-                        D3D12_HEAP_FLAG_NONE,
-                        &desc,
-                        D3D12_RESOURCE_STATE_COMMON,
-                        None,
-                        &mut texture,
-                    )
-                    .ok()?;
-                let texture = texture?;
                 texture.Map(0, None, None).ok()?;
                 let texel = [255u8, 0, 255, 255];
                 texture.WriteToSubresource(0, None, texel.as_ptr().cast(), 4, 4).ok()?;

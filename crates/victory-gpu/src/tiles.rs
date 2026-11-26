@@ -9,6 +9,7 @@ use std::mem::ManuallyDrop;
 use std::ops::Range;
 use std::sync::{Mutex, OnceLock};
 
+use victory_host::Device as _;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::Interface;
 
@@ -115,21 +116,12 @@ impl Pool {
         }
         let capacity = u64::from(tiles.max(HEAP_TILES)).min(available) as u32;
         let size = u64::from(capacity) * TILE_BYTES;
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: size,
-            Properties: D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
-            Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
-            ..Default::default()
-        };
-        let mut resource = None;
-        // SAFETY: the heap size is a whole number of D3D12 tiles and the
-        // output holds the COM heap on success.
-        unsafe { device.CreateHeap(&desc, &mut resource).ok()? };
+        // A whole number of tiles, default (64 KiB) alignment.
+        let resource = crate::backend::D3d12(device)
+            .heap(victory_host::Memory::Device, size, 0, victory_host::HeapUse::Textures)
+            .ok()?;
         let heap = Heap {
-            resource: resource?,
+            resource,
             tiles: capacity,
             free: (tiles < capacity)
                 .then_some(tiles..capacity)

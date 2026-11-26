@@ -10,6 +10,8 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use victory_formats::texture;
+#[cfg(windows)]
+use victory_host::{Device as _, Memory as HostMemory};
 
 #[cfg(windows)]
 mod small;
@@ -87,21 +89,8 @@ pub(crate) struct HeapDesc {
     flags: u32,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ResourceDesc {
-    dimension: u32,
-    alignment: u64,
-    width: u64,
-    height: u32,
-    depth_or_array_size: u16,
-    mip_levels: u16,
-    format: u32,
-    sample_count: u32,
-    sample_quality: u32,
-    layout: u32,
-    flags: u32,
-}
+/// Shared with the host seam (victory-host), which owns the layout.
+pub(crate) use victory_host::ResourceDesc;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,7 +428,6 @@ fn twin_texture(
     depth: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
 ) -> Option<std::sync::Arc<Twin>> {
     use std::sync::atomic::Ordering::Relaxed;
-    use windows::Win32::Graphics::Direct3D12::*;
     const DEPTH_AND_UNORDERED: u32 = 6;
     const UNORDERED: u32 = 4;
     const UNORDERED_ACCESS: u32 = 0x8;
@@ -474,26 +462,11 @@ fn twin_texture(
     d.alignment = 0;
     d.flags = UNORDERED;
     d.format = if stencil { R8_TYPELESS } else { typeless };
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout, as in `host_texture`;
-    // the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
-            None,
-            &mut texture,
-        )
-    };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture");
-    }
+    let gpu = crate::backend::D3d12(&host.device);
+    let texture = gpu
+        .committed(HostMemory::Device, &d, UNORDERED_ACCESS, None)
+        .inspect_err(|e| tracing::warn!(error = %e, desc = ?d, "no colour twin for a depth texture"))
+        .ok();
     let Some(texture) = texture else {
         TWINS[1].fetch_add(1, Relaxed);
         return None;
@@ -508,20 +481,7 @@ fn twin_texture(
         // SAFETY: a live texture.
         let of = unsafe { depth.GetDesc() };
         let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
-        let mut bytes = 0;
-        // SAFETY: a plain query; the out pointer is ours.
-        unsafe {
-            host.device.GetCopyableFootprints(
-                &of,
-                planes,
-                planes,
-                0,
-                None,
-                None,
-                None,
-                Some(&mut bytes),
-            );
-        }
+        let bytes = gpu.copyable_bytes(&crate::backend::console_desc(&of), planes, planes);
         let Some(buffer) = host.uav_buffer(bytes) else {
             TWINS[1].fetch_add(1, Relaxed);
             return None;
@@ -542,22 +502,10 @@ fn twin_texture(
         } else {
             39
         };
-        let mut texture: Option<ID3D12Resource> = None;
-        // SAFETY: as for the first twin.
-        let made = unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                (&raw const d).cast(),
-                D3D12_RESOURCE_STATES(UNORDERED_ACCESS as i32),
-                None,
-                &mut texture,
-            )
-        };
-        if let Err(e) = made {
-            tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane");
-        }
-        texture.map(|texture| {
+        gpu.committed(HostMemory::Device, &d, UNORDERED_ACCESS, None)
+            .inspect_err(|e| tracing::warn!(error = %e, desc = ?d, "no twin for a depth plane"))
+            .ok()
+            .map(|texture| {
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -1900,10 +1848,8 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
         return 0;
     };
     // SAFETY: plain queries on a live resource and device.
-    unsafe {
-        let desc = texture.GetDesc();
-        host.device.GetResourceAllocationInfo(0, &[desc]).SizeInBytes
-    }
+    let desc = unsafe { texture.GetDesc() };
+    crate::backend::D3d12(&host.device).allocation(&crate::backend::console_desc(&desc)).size
 }
 
 #[cfg(windows)]
@@ -2081,10 +2027,6 @@ fn host_texture(
         }
         value
     });
-    let heap = D3D12_HEAP_PROPERTIES {
-        Type: D3D12_HEAP_TYPE_DEFAULT,
-        ..Default::default()
-    };
     let state = D3D12_RESOURCE_STATES(
         crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
     );
@@ -2095,9 +2037,10 @@ fn host_texture(
             Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
             ..*native
         };
-        let mut reserved = None;
-        // SAFETY: non-writable, single-slice 2D descriptor on a tiled-resources device.
-        unsafe { let _ = host.device.CreateReservedResource(&description, state, None, &mut reserved); }
+        // Non-writable, single-slice 2D description on a tiled-resources device.
+        let reserved = crate::backend::D3d12(&host.device)
+            .reserved(&crate::backend::console_desc(&description), state.0 as u32)
+            .ok();
         if let Some(texture) = reserved
             && let Some(tiles) = crate::tiles::Tiled::new(&host.device, &texture, u32::from(d.mip_levels))
         {
@@ -2109,18 +2052,14 @@ fn host_texture(
         texture = host.small_textures.place(&host.device, native, state);
     }
     if texture.is_none() {
-        // SAFETY: the clear value, when present, has the host layout.
-        if let Err(e) = unsafe {
-            host.device.CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                native,
-                state,
-                clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-                &mut texture,
-            )
-        } {
-            tracing::warn!(error = %e, desc = ?d, "no host texture");
+        match crate::backend::D3d12(&host.device).committed(
+            HostMemory::Device,
+            &d,
+            state.0 as u32,
+            clear_value.as_ref(),
+        ) {
+            Ok(t) => texture = Some(t),
+            Err(e) => tracing::warn!(error = %e, desc = ?d, "no host texture"),
         }
     }
     if let Some(t) = &texture {

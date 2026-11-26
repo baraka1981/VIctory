@@ -6,6 +6,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::GUID;
+use victory_host::{Device as _, HeapUse, Memory};
+
+use crate::backend::{D3d12, console_desc};
 
 const PAGE: u64 = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT as u64;
 const ALIGN: u64 = D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT as u64;
@@ -83,12 +86,12 @@ impl SmallTextures {
         let size = match pool.sizes.get(&shape) {
             Some(size) => *size,
             None => {
-                // SAFETY: query the complete native description, including every mip.
-                let allocation = unsafe { device.GetResourceAllocationInfo(0, &[d]) };
-                let size = (allocation.Alignment == ALIGN
-                    && (ALIGN..PAGE).contains(&allocation.SizeInBytes)
-                    && allocation.SizeInBytes.is_multiple_of(ALIGN))
-                .then_some(allocation.SizeInBytes);
+                // The complete native description, including every mip.
+                let allocation = D3d12(device).allocation(&console_desc(&d));
+                let size = (allocation.alignment == ALIGN
+                    && (ALIGN..PAGE).contains(&allocation.size)
+                    && allocation.size.is_multiple_of(ALIGN))
+                .then_some(allocation.size);
                 if pool.sizes.len() < 256 {
                     pool.sizes.insert(shape, size);
                 }
@@ -100,19 +103,9 @@ impl SmallTextures {
             .as_ref()
             .is_none_or(|(_, used)| used + size > PAGE)
         {
-            let mut heap = None;
-            let desc = D3D12_HEAP_DESC {
-                SizeInBytes: PAGE,
-                Alignment: PAGE,
-                Properties: D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
-            };
-            // SAFETY: a standard aligned default heap and a typed out pointer.
-            unsafe { device.CreateHeap(&desc, &mut heap).ok()? };
-            pool.current = Some((heap?, 0));
+            // A standard aligned default heap.
+            let heap = D3d12(device).heap(Memory::Device, PAGE, PAGE, HeapUse::Textures).ok()?;
+            pool.current = Some((heap, 0));
             #[cfg(feature = "diagnostics")]
             {
                 pool.heaps_made += 1;
@@ -128,14 +121,10 @@ impl SmallTextures {
         // threads can proceed independently; a failed range is never reused.
         drop(pool);
         let (heap, offset) = placement;
-        let mut texture: Option<ID3D12Resource> = None;
-        // SAFETY: this range is aligned, fits this heap, and has never been used.
-        unsafe {
-            device
-                .CreatePlacedResource(&heap, offset, &d, state, None, &mut texture)
-                .ok()?
-        };
-        let texture = texture?;
+        // This range is aligned, fits this heap, and has never been used.
+        let texture = D3d12(device)
+            .placed(&heap, offset, &console_desc(&d), state.0 as u32)
+            .ok()?;
         // Also retain the heap for independent COM references in descriptors and
         // in-flight command lists, through final release of the native texture.
         unsafe { texture.SetPrivateDataInterface(&BACKING_HEAP, &heap).ok()? };
