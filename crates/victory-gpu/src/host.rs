@@ -1382,8 +1382,7 @@ fn record_plane_pass(
             // SAFETY: an open list; a slot of our heap; live resources and
             // objects (the pass's own live as long as the process).
             unsafe {
-                host.device
-                    .CreateShaderResourceView(plane, Some(&view), cpu);
+                crate::backend::D3d12(&host.device).shader_view(Some(plane), Some(crate::backend::srv(&view)), cpu.ptr);
                 list.SetDescriptorHeaps(&[Some(pass.views.clone())]);
                 list.SetGraphicsRootSignature(&root);
                 list.SetPipelineState(&pipeline);
@@ -5908,8 +5907,7 @@ impl Host {
         unsafe {
             let mut handle = self.rtvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.rtv_size) as usize;
-            self.device
-                .CreateRenderTargetView(resource, desc.map(|d| d as *const _), handle);
+            crate::backend::D3d12(&self.device).target_view(resource, desc.map(crate::backend::rtv), handle.ptr);
             handle
         }
     }
@@ -5925,8 +5923,7 @@ impl Host {
         unsafe {
             let mut handle = self.dsvs.GetCPUDescriptorHandleForHeapStart();
             handle.ptr += (slot * self.dsv_size) as usize;
-            self.device
-                .CreateDepthStencilView(resource, desc.map(|d| d as *const _), handle);
+            crate::backend::D3d12(&self.device).depth_view(Some(resource), desc.map(crate::backend::dsv), handle.ptr);
             handle
         }
     }

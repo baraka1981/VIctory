@@ -1098,7 +1098,7 @@ impl HostHeap {
             let mut filled = 1;
             while filled < NULL_BLOCK {
                 let n = filled.min(NULL_BLOCK - filled);
-                host.device.CopyDescriptorsSimple(n, at(filled), start, kind);
+                crate::backend::D3d12(&host.device).copy_descriptors(n, at(filled).ptr, start.ptr, crate::backend::descriptors(kind));
                 filled += n;
             }
             self.copy_nulls(host, start, kind, 0, total);
@@ -1123,8 +1123,7 @@ impl HostHeap {
             // SAFETY: the source holds NULL_BLOCK identical descriptors of
             // this kind; the caller owns the entire destination range.
             unsafe {
-                host.device
-                    .CopyDescriptorsSimple(n, self.cpu(first + done), source, kind)
+                crate::backend::D3d12(&host.device).copy_descriptors(n, self.cpu(first + done).ptr, source.ptr, crate::backend::descriptors(kind))
             };
             done += n;
         }
@@ -1150,7 +1149,7 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         ..Default::default()
     };
     // SAFETY: a slot of a sampler heap of ours.
-    unsafe { host.device.CreateSampler(&desc, at) };
+    unsafe { crate::backend::D3d12(&host.device).sampler(crate::backend::sampler(&desc), at.ptr) };
 }
 
 impl HostHeap {
@@ -2269,8 +2268,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
-            host.device
-                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+            crate::backend::D3d12(&host.device).shader_view(Some(buffer), Some(crate::backend::srv(&desc)), self.cpu(index).ptr)
         };
         self.keep(index, Some(buffer.clone()));
     }
@@ -2343,12 +2341,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
-            host.device.CreateUnorderedAccessView(
-                buffer,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
+            crate::backend::D3d12(&host.device).unordered_view(Some(buffer), Some(crate::backend::uav(&desc)), self.cpu(index).ptr)
         };
         self.keep(index, Some(buffer.clone()));
     }
@@ -2371,12 +2364,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap; a null resource is allowed with a desc.
         unsafe {
-            host.device.CreateUnorderedAccessView(
-                None::<&ID3D12Resource>,
-                None::<&ID3D12Resource>,
-                Some(&desc),
-                self.cpu(index),
-            )
+            crate::backend::D3d12(&host.device).unordered_view(None, Some(crate::backend::uav(&desc)), self.cpu(index).ptr)
         };
     }
 
@@ -2400,8 +2388,7 @@ impl HostHeap {
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
-            host.device
-                .CreateConstantBufferView(Some(&desc), self.cpu(index))
+            crate::backend::D3d12(&host.device).constant_view(desc.BufferLocation, desc.SizeInBytes, self.cpu(index).ptr)
         };
     }
 
@@ -3110,8 +3097,7 @@ fn buffer_srv(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+        crate::backend::D3d12(&host.device).shader_view(Some(&shadow.buffer), Some(crate::backend::srv(&desc)), at.ptr)
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -3190,8 +3176,7 @@ fn buffer_uav(
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
-        host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+        crate::backend::D3d12(&host.device).unordered_view(Some(&shadow.buffer), Some(crate::backend::uav(&desc)), at.ptr)
     };
     Some(Some(shadow.buffer.clone()))
 }
@@ -3356,7 +3341,7 @@ fn make(
                 SizeInBytes: constant_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            unsafe { crate::backend::D3d12(device).constant_view(desc.BufferLocation, desc.SizeInBytes, at.ptr) };
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -3431,11 +3416,7 @@ fn make(
                 }
                 let write = || unsafe {
                     // SAFETY: a live texture and a slot of our heap.
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
+                    crate::backend::D3d12(device).shader_view(Some(texture), desc.as_ref().map(crate::backend::srv), at.ptr)
                 };
                 if title_slot && let Some(sample) = sampled.as_mut() {
                     let mut published = false;
@@ -3509,12 +3490,7 @@ fn make(
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
-                device.CreateUnorderedAccessView(
-                    texture,
-                    None::<&ID3D12Resource>,
-                    desc.as_ref().map(std::ptr::from_ref),
-                    at,
-                )
+                crate::backend::D3d12(device).unordered_view(Some(texture), desc.as_ref().map(crate::backend::uav), at.ptr)
             };
             Some(Some(texture.clone()))
         }
@@ -3526,13 +3502,13 @@ fn make(
                     .read_unaligned()
             };
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { crate::backend::D3d12(device).sampler(crate::backend::sampler(&desc), at.ptr) };
             Some(None)
         }
         View::ConsoleSampler(words) => {
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
-            unsafe { device.CreateSampler(&desc, at) };
+            unsafe { crate::backend::D3d12(device).sampler(crate::backend::sampler(&desc), at.ptr) };
             Some(None)
         }
         View::Placed(unordered, resource, desc) => {
@@ -3712,7 +3688,7 @@ fn magenta_for(desc: &[u32; 16], at: D3D12_CPU_DESCRIPTOR_HANDLE) -> bool {
         return false;
     };
     // SAFETY: a slot of our heap and a live texture.
-    unsafe { host.device.CreateShaderResourceView(texture, None, at) };
+    unsafe { crate::backend::D3d12(&host.device).shader_view(Some(texture), None, at.ptr) };
     true
 }
 
@@ -3785,7 +3761,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         View::Constant(..) => {
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
             // SAFETY: a slot of our heap; a zero location makes a null view.
-            return unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
+            return unsafe { crate::backend::D3d12(&host.device).constant_view(desc.BufferLocation, desc.SizeInBytes, at.ptr) };
         }
         _ => return null_view(at),
     };
@@ -3800,12 +3776,7 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device.CreateUnorderedAccessView(
-            None::<&ID3D12Resource>,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
+        crate::backend::D3d12(&host.device).unordered_view(None, Some(crate::backend::uav(&desc)), at.ptr)
     };
 }
 
@@ -3867,8 +3838,7 @@ fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        crate::backend::D3d12(&host.device).shader_view(None, Some(crate::backend::srv(&desc)), at.ptr)
     };
 }
 
@@ -3894,8 +3864,7 @@ fn null_like(words: &[u32; 10], at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        crate::backend::D3d12(&host.device).shader_view(None, Some(crate::backend::srv(&desc)), at.ptr)
     };
 }
 
@@ -3918,8 +3887,7 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
-        host.device
-            .CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at)
+        crate::backend::D3d12(&host.device).shader_view(None, Some(crate::backend::srv(&desc)), at.ptr)
     };
 }
 

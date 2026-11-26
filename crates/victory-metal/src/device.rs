@@ -8,13 +8,15 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
-    MTLPixelFormat, MTLResourceOptions, MTLStorageMode, MTLTexture, MTLTextureDescriptor,
-    MTLTextureType, MTLTextureUsage,
+    MTLPixelFormat, MTLResourceOptions, MTLSamplerState, MTLStorageMode, MTLTexture,
+    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
 use victory_host::{
-    Allocation, ClearValue, Descriptors, Device, HeapUse, Memory, ResourceDesc, dimension, flags,
+    Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
+    SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, dimension, flags, view,
 };
 
+use crate::views::{self, Kept, Slots, Target, resource_id};
 use crate::{DESCRIPTOR_BYTES, MetalError, format, layout};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -38,17 +40,46 @@ pub struct MetalDescriptorHeap {
 
 pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
+    /// Metal objects descriptor slots refer to, by slot address.
+    slots: Slots,
 }
 
 impl MetalDevice {
     /// The system's default GPU (the only one on Apple silicon).
     pub fn system_default() -> Result<MetalDevice, MetalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
-        Ok(MetalDevice { device })
+        Ok(MetalDevice {
+            device,
+            slots: Slots::default(),
+        })
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
         &self.device
+    }
+
+    /// The render target or depth view written at slot `at`, for render
+    /// pass attachments.
+    pub fn target(&self, at: usize) -> Option<Target> {
+        self.slots.target(at)
+    }
+
+    /// Writes an entry and what keeps it valid.
+    ///
+    /// # Safety
+    /// `at` is an entry of a live descriptor table.
+    unsafe fn put(&self, at: usize, words: [u64; 3], kept: Option<Kept>) {
+        self.slots.set(at, kept);
+        // SAFETY: the caller's entry.
+        unsafe { views::write(at, words) }
+    }
+
+    fn texture_entry(texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>) -> ([u64; 3], Option<Kept>) {
+        match texture {
+            Some(t) => ([0, resource_id(t.gpuResourceID()), 0], Some(Kept::Texture(t))),
+            // A view Metal refused reads as a null one.
+            None => ([0; 3], None),
+        }
     }
 }
 
@@ -266,13 +297,97 @@ impl Device for MetalDevice {
     fn descriptor_step(&self, _kind: Descriptors) -> u32 {
         DESCRIPTOR_BYTES
     }
+
+    fn descriptor_start(&self, heap: &MetalDescriptorHeap) -> usize {
+        heap.table.contents().as_ptr() as usize
+    }
+
+    unsafe fn shader_view(&self, resource: Option<&MetalResource>, desc: Option<&ShaderViewDesc>, at: usize) {
+        let (words, kept) = match resource {
+            None => ([0; 3], None),
+            Some(MetalResource::Buffer(b)) => match desc {
+                Some(d) if d.dimension == view::BUFFER => (views::buffer_entry(b, d.buffer(), d.format), None),
+                _ => ([b.gpuAddress(), 0, b.length() as u64], None),
+            },
+            Some(MetalResource::Texture(t)) => Self::texture_entry(views::shader_texture(t, desc)),
+        };
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, words, kept) }
+    }
+
+    unsafe fn unordered_view(
+        &self,
+        resource: Option<&MetalResource>,
+        desc: Option<&UnorderedViewDesc>,
+        at: usize,
+    ) {
+        let (words, kept) = match resource {
+            None => ([0; 3], None),
+            Some(MetalResource::Buffer(b)) => match desc {
+                Some(d) if d.dimension == view::BUFFER => (views::buffer_entry(b, d.buffer(), d.format), None),
+                _ => ([b.gpuAddress(), 0, b.length() as u64], None),
+            },
+            Some(MetalResource::Texture(t)) => Self::texture_entry(views::unordered_texture(t, desc)),
+        };
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, words, kept) }
+    }
+
+    unsafe fn constant_view(&self, address: u64, bytes: u32, at: usize) {
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, [address, 0, u64::from(bytes)], None) }
+    }
+
+    unsafe fn sampler(&self, desc: &SamplerDesc, at: usize) {
+        let (words, kept) = match views::sampler(&self.device, desc) {
+            Some(s) => (
+                [resource_id(s.gpuResourceID()), 0, u64::from(desc.mip_lod_bias.to_bits())],
+                Some(Kept::Sampler(s)),
+            ),
+            None => ([0; 3], None),
+        };
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, words, kept) }
+    }
+
+    unsafe fn target_view(&self, resource: Option<&MetalResource>, desc: Option<&TargetViewDesc>, at: usize) {
+        let target = match resource {
+            Some(MetalResource::Texture(t)) => views::target(t, desc),
+            _ => None,
+        };
+        let (words, kept) = match target {
+            Some(t) => ([0, resource_id(t.texture.gpuResourceID()), 0], Some(Kept::Target(t))),
+            None => ([0; 3], None),
+        };
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, words, kept) }
+    }
+
+    unsafe fn depth_view(&self, resource: Option<&MetalResource>, desc: Option<&DepthViewDesc>, at: usize) {
+        let (words, kept) = match resource {
+            Some(MetalResource::Texture(t)) => {
+                let target = views::depth(t, desc);
+                ([0, resource_id(target.texture.gpuResourceID()), 0], Some(Kept::Target(target)))
+            }
+            _ => ([0; 3], None),
+        };
+        // SAFETY: the caller's slot.
+        unsafe { self.put(at, words, kept) }
+    }
+
+    unsafe fn copy_descriptors(&self, count: u32, to: usize, from: usize, _kind: Descriptors) {
+        let step = DESCRIPTOR_BYTES as usize;
+        // SAFETY: the caller's ranges, in live tables; they may overlap.
+        unsafe { core::ptr::copy(from as *const u8, to as *mut u8, count as usize * step) };
+        self.slots.copy(count, to, from, step);
+    }
 }
 
 /// Run on a Mac: `cargo test -p victory-metal`. Needs a GPU, so not in CI.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use victory_host::state;
+    use victory_host::{state, view};
 
     fn texture(width: u64, height: u32, format: u32, flags: u32) -> ResourceDesc {
         ResourceDesc {
@@ -350,6 +465,83 @@ mod tests {
         let table = gpu.descriptor_heap(Descriptors::Views, 1000, true).expect("table");
         assert_eq!(table.table.length(), 1000 * DESCRIPTOR_BYTES as usize);
         assert_eq!(gpu.descriptor_step(Descriptors::Views), DESCRIPTOR_BYTES);
+    }
+
+    #[test]
+    fn views_and_samplers_fill_table_entries() {
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let table = gpu.descriptor_heap(Descriptors::Views, 8, true).unwrap();
+        let start = gpu.descriptor_start(&table);
+        let step = gpu.descriptor_step(Descriptors::Views) as usize;
+        let entry = |i: usize| unsafe { ((start + i * step) as *const [u64; 3]).read() };
+
+        let Ok(buffer) = gpu.committed(Memory::Device, &ResourceDesc::buffer(4096, 0), state::COMMON, None)
+        else {
+            panic!("buffer")
+        };
+        let MetalResource::Buffer(b) = &buffer else { unreachable!() };
+        // Raw view: elements 16.. (64 bytes in), 32 elements of 4 bytes.
+        let raw = ShaderViewDesc {
+            format: 39,
+            dimension: view::BUFFER,
+            mapping: 0x1688,
+            _pad: 0,
+            fields: [16, 32, u64::from(view::BUFFER_RAW)],
+        };
+        unsafe { gpu.shader_view(Some(&buffer), Some(&raw), start) };
+        assert_eq!(entry(0), [b.gpuAddress() + 64, 0, 128]);
+
+        // A texture, whole, then as a one-mip view: both name a resource id.
+        let desc = texture(64, 64, 28, 0);
+        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
+        unsafe { gpu.shader_view(Some(&tex), None, start + step) };
+        assert_ne!(entry(1)[1], 0);
+        let one_mip = ShaderViewDesc {
+            format: 29, // sRGB view of an RGBA8 texture
+            dimension: view::TEXTURE_2D,
+            mapping: 0x1688,
+            _pad: 0,
+            fields: [2 | (1 << 32), 0, 0],
+        };
+        unsafe { gpu.shader_view(Some(&tex), Some(&one_mip), start + 2 * step) };
+        assert_ne!(entry(2)[1], 0);
+        assert_ne!(entry(2)[1], entry(1)[1], "a view is its own resource");
+
+        // Null view, constant view, copy.
+        unsafe { gpu.shader_view(None, None, start + 3 * step) };
+        assert_eq!(entry(3), [0; 3]);
+        unsafe { gpu.constant_view(b.gpuAddress(), 256, start + 4 * step) };
+        assert_eq!(entry(4), [b.gpuAddress(), 0, 256]);
+        unsafe { gpu.copy_descriptors(2, start + 5 * step, start + step, Descriptors::Views) };
+        assert_eq!(entry(5), entry(1));
+        assert_eq!(entry(6), entry(2));
+
+        // A linear wrap sampler.
+        let samplers = gpu.descriptor_heap(Descriptors::Samplers, 1, true).unwrap();
+        let at = gpu.descriptor_start(&samplers);
+        let linear = SamplerDesc {
+            filter: 0x15,
+            address: [1, 1, 1],
+            mip_lod_bias: 0.5,
+            max_anisotropy: 1,
+            comparison: 0,
+            border: [0.0; 4],
+            min_lod: 0.0,
+            max_lod: 1000.0,
+        };
+        unsafe { gpu.sampler(&linear, at) };
+        let s = unsafe { (at as *const [u64; 3]).read() };
+        assert_ne!(s[0], 0);
+        assert_eq!(s[2], u64::from(0.5f32.to_bits()));
+
+        // A render target view is remembered for render passes.
+        let targets = gpu.descriptor_heap(Descriptors::Targets, 1, false).unwrap();
+        let rt = gpu
+            .committed(Memory::Device, &texture(32, 32, 28, flags::RENDER_TARGET), state::COMMON, None)
+            .unwrap();
+        let at = gpu.descriptor_start(&targets);
+        unsafe { gpu.target_view(Some(&rt), None, at) };
+        assert!(gpu.target(at).is_some());
     }
 
     #[test]

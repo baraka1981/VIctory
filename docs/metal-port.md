@@ -16,19 +16,18 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 1. Workspace builds + tests on non-Windows (Linux/macOS). Windows unchanged.
 2. `victory-host`: `Device` trait — committed / reserved / placed resources, heaps, allocation info, copyable sizes, descriptor heaps + step. `ResourceDesc` moved there, same layout as `D3D12_RESOURCE_DESC` (offsets tested).
 3. victory-gpu production creation paths go through it: host textures (clear values, tiled/reserved), depth twins, small-texture heaps, tile heaps, readback/upload/GPU-upload/shared/UAV buffers, RTV/DSV rings, plane pass, view/sampler heaps, null block, magenta fallback.
-4. `victory-metal`: `Device` on Metal (objc2-metal). Format table (DXGI → MTLPixelFormat, numbers cross-checked vs objc2-metal), D3D12-rules copy layouts, private/shared storage by `Memory`, placement heaps, sparse heaps for reserved textures. Portable bits unit-tested on Linux.
+4. views + samplers in the seam (`shader_view` / `unordered_view` / `constant_view` / `sampler` / `target_view` / `depth_view` / `copy_descriptors` / `descriptor_start`). Descs are D3D12.X's layouts (`ShaderViewDesc` etc., size/align checked against D3D12's). All 23 production view writes in victory-gpu go through it.
+5. `victory-metal`: `Device` on Metal (objc2-metal). Format table (DXGI → MTLPixelFormat, numbers cross-checked vs objc2-metal), D3D12-rules copy layouts, private/shared storage by `Memory`, placement heaps, sparse heaps for reserved textures. Views write MSC-style table entries (buffer: addr/0/len, texture: 0/resource id/0, sampler: id/0/lod bias); texture views via `newTextureViewWithPixelFormat:...`, samplers via `MTLSamplerDescriptor` (argument buffer support on); objects a slot needs are kept alive per slot address; RTV/DSV slots remembered for render passes (`MetalDevice::target`). Portable bits unit-tested on Linux.
 
 ## Still direct D3D12 in victory-gpu
 
 - copy footprints *with layouts* (`texture.rs`, `texback.rs`, `host.rs` `record_twin_copy`) — they feed copy commands, move with slice 2
 - title-memory heaps (`inplace.rs`, OpenExistingHeapFromAddress) — Metal analogue: `newBufferWithBytesNoCopy` on page-aligned title memory. Big one for VRAM.
 - `CheckFeatureSupport` calls
-- views: `CreateShaderResourceView` / UAV / CBV / sampler / RTV / DSV (`descriptor/host.rs`, `host.rs`, `indirect.rs`)
 - diagnostics/probes (`capture.rs`, timestamps, `memory/*_probe.rs`) + GPU tests — fine to stay D3D12
 
 ## Next slices
 
-1b. views + samplers in the seam (view desc words are D3D12's 24-byte layout already; Metal writes table entries: gpuVA / texture resource id / metadata)
 2. command recording: lists, barriers (no-op-ish on Metal), copies, draws/dispatch, footprints
 3. pipelines + root signatures (MSC root signature → top-level argument buffer), tile mapping for sparse
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
@@ -58,7 +57,8 @@ Type-checks only. Runtime still needs: Windows + a game for the D3D12 side, a Ma
 
 ## Gotchas
 
-- `crates/victory-formats/src/bcpack-tables.bin` comes from `Initialize-FormatTables.ps1`; bcpack tests fail without it.
+- `crates/victory-formats/src/bcpack-tables.bin` comes from `Initialize-FormatTables.ps1` (or curl the pinned Marvisak URL in that script, check the SHA-256); bcpack tests fail without it.
+- Metal table entry metadata words follow MSC's runtime header from memory — check vs `metal_irconverter_runtime.h` when shaders run. Typed buffer SRV/UAVs need texture-buffer views (TODO), stencil-plane views too.
 - Packed 16-bit formats (B5G6R5, BGR5A1, B4G4R4A4) channel order vs Metal unverified — needs a draw-and-read test.
 - No D24S8 on Apple silicon → D32FS8 (same as MoltenVK/D3DMetal).
 - 16 KB pages under Rosetta/Wine vs the page-guard + DirectStorage tricks: biggest runtime risk, test early.

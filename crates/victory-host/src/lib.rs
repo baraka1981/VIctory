@@ -132,6 +132,115 @@ pub enum Descriptors {
     Depth,
 }
 
+/// A shader resource view description in D3D12.X's layout
+/// (`D3D12_SHADER_RESOURCE_VIEW_DESC`): format, view dimension, component
+/// mapping, then the dimension's own fields (first element / mip, counts,
+/// flags) as D3D12 lays them out.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShaderViewDesc {
+    pub format: u32,
+    pub dimension: u32,
+    pub mapping: u32,
+    pub _pad: u32,
+    pub fields: [u64; 3],
+}
+
+/// An unordered access view description (`D3D12_UNORDERED_ACCESS_VIEW_DESC`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnorderedViewDesc {
+    pub format: u32,
+    pub dimension: u32,
+    pub fields: [u64; 4],
+}
+
+/// A render target view description (`D3D12_RENDER_TARGET_VIEW_DESC`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetViewDesc {
+    pub format: u32,
+    pub dimension: u32,
+    pub fields: [u64; 2],
+}
+
+/// A depth-stencil view description (`D3D12_DEPTH_STENCIL_VIEW_DESC`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthViewDesc {
+    pub format: u32,
+    pub dimension: u32,
+    pub flags: u32,
+    pub fields: [u32; 3],
+}
+
+/// A sampler description (`D3D12_SAMPLER_DESC`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerDesc {
+    pub filter: u32,
+    pub address: [u32; 3],
+    pub mip_lod_bias: f32,
+    pub max_anisotropy: u32,
+    pub comparison: u32,
+    pub border: [f32; 4],
+    pub min_lod: f32,
+    pub max_lod: f32,
+}
+
+const _: () = assert!(size_of::<ShaderViewDesc>() == 40);
+const _: () = assert!(size_of::<UnorderedViewDesc>() == 40);
+const _: () = assert!(size_of::<TargetViewDesc>() == 24);
+const _: () = assert!(size_of::<DepthViewDesc>() == 24);
+const _: () = assert!(size_of::<SamplerDesc>() == 52);
+
+/// View dimension values (D3D12 numbering) the backends read.
+pub mod view {
+    pub const BUFFER: u32 = 1;
+    pub const TEXTURE_1D: u32 = 2;
+    pub const TEXTURE_1D_ARRAY: u32 = 3;
+    pub const TEXTURE_2D: u32 = 4;
+    pub const TEXTURE_2D_ARRAY: u32 = 5;
+    pub const TEXTURE_2D_MS: u32 = 6;
+    pub const TEXTURE_2D_MS_ARRAY: u32 = 7;
+    pub const TEXTURE_3D: u32 = 8;
+    pub const TEXTURE_CUBE: u32 = 9;
+    pub const TEXTURE_CUBE_ARRAY: u32 = 10;
+    /// Buffer view flag: raw (byte address) access.
+    pub const BUFFER_RAW: u32 = 1;
+}
+
+impl ShaderViewDesc {
+    /// For a buffer view: (first element, element count, stride, flags).
+    pub fn buffer(&self) -> (u64, u32, u32, u32) {
+        let f = self.fields;
+        (f[0], f[1] as u32, (f[1] >> 32) as u32, f[2] as u32)
+    }
+
+    /// For a texture view: (most detailed mip, mip count, first slice,
+    /// slice count); cube views count faces in slices of six.
+    pub fn texture(&self) -> (u32, u32, u32, u32) {
+        let w = |i: usize| (self.fields[i / 2] >> (32 * (i % 2))) as u32;
+        match self.dimension {
+            view::TEXTURE_1D | view::TEXTURE_2D | view::TEXTURE_3D | view::TEXTURE_CUBE => {
+                (w(0), w(1), 0, 1)
+            }
+            view::TEXTURE_1D_ARRAY | view::TEXTURE_CUBE_ARRAY => (w(0), w(1), w(2), w(3)),
+            view::TEXTURE_2D_ARRAY => (w(0), w(1), w(2), w(3)),
+            view::TEXTURE_2D_MS_ARRAY => (0, 1, w(0), w(1)),
+            _ => (0, 1, 0, 1),
+        }
+    }
+}
+
+impl UnorderedViewDesc {
+    /// For a buffer view: (first element, element count, stride, flags).
+    pub fn buffer(&self) -> (u64, u32, u32, u32) {
+        let f = self.fields;
+        (f[0], f[1] as u32, (f[1] >> 32) as u32, f[3] as u32)
+    }
+}
+
 /// What a host graphics API provides the console side (slice 1).
 ///
 /// Methods take `&self` and are called from the title's threads at once:
@@ -198,6 +307,75 @@ pub trait Device {
 
     /// Bytes between two descriptors of `kind` in a heap.
     fn descriptor_step(&self, kind: Descriptors) -> u32;
+
+    /// The CPU address of `heap`'s first descriptor; slot `i` is at
+    /// `start + i * step`. The view methods below write at such addresses.
+    fn descriptor_start(&self, heap: &Self::DescriptorHeap) -> usize;
+
+    /// A shader resource view of `resource` at `at`; a null view (reads
+    /// zeros) without one. With no `desc`, the whole resource as it is.
+    ///
+    /// # Safety
+    /// `at` is a slot of a live view heap of this device.
+    unsafe fn shader_view(
+        &self,
+        resource: Option<&Self::Resource>,
+        desc: Option<&ShaderViewDesc>,
+        at: usize,
+    );
+
+    /// An unordered access view of `resource` at `at` (null: reads zeros,
+    /// writes dropped).
+    ///
+    /// # Safety
+    /// As for [`Device::shader_view`].
+    unsafe fn unordered_view(
+        &self,
+        resource: Option<&Self::Resource>,
+        desc: Option<&UnorderedViewDesc>,
+        at: usize,
+    );
+
+    /// A constant buffer view of `bytes` at GPU `address`.
+    ///
+    /// # Safety
+    /// As for [`Device::shader_view`]; the memory stays live while the
+    /// view is used.
+    unsafe fn constant_view(&self, address: u64, bytes: u32, at: usize);
+
+    /// A sampler at `at`.
+    ///
+    /// # Safety
+    /// `at` is a slot of a live sampler heap of this device.
+    unsafe fn sampler(&self, desc: &SamplerDesc, at: usize);
+
+    /// A render target view at `at`.
+    ///
+    /// # Safety
+    /// `at` is a slot of a live target heap of this device.
+    unsafe fn target_view(
+        &self,
+        resource: Option<&Self::Resource>,
+        desc: Option<&TargetViewDesc>,
+        at: usize,
+    );
+
+    /// A depth-stencil view at `at`.
+    ///
+    /// # Safety
+    /// `at` is a slot of a live depth heap of this device.
+    unsafe fn depth_view(
+        &self,
+        resource: Option<&Self::Resource>,
+        desc: Option<&DepthViewDesc>,
+        at: usize,
+    );
+
+    /// Copies `count` descriptors of `kind` from `from` to `to`.
+    ///
+    /// # Safety
+    /// Both ranges are slots of live heaps of `kind` of this device.
+    unsafe fn copy_descriptors(&self, count: u32, to: usize, from: usize, kind: Descriptors);
 }
 
 #[cfg(test)]
@@ -216,6 +394,28 @@ mod tests {
         assert_eq!(core::mem::offset_of!(ResourceDesc, sample_count), 36);
         assert_eq!(core::mem::offset_of!(ResourceDesc, layout), 44);
         assert_eq!(core::mem::offset_of!(ResourceDesc, flags), 48);
+    }
+
+    #[test]
+    fn view_descriptions_read_their_fields() {
+        // A raw buffer SRV: first element 16, 64 elements, stride 0, raw.
+        let v = ShaderViewDesc {
+            format: 39,
+            dimension: view::BUFFER,
+            mapping: 0x1688,
+            _pad: 0,
+            fields: [16, 64, u64::from(view::BUFFER_RAW)],
+        };
+        assert_eq!(v.buffer(), (16, 64, 0, view::BUFFER_RAW));
+        // A 2D array view: mip 1, 3 mips, slices 2..6.
+        let a = ShaderViewDesc {
+            format: 28,
+            dimension: view::TEXTURE_2D_ARRAY,
+            mapping: 0x1688,
+            _pad: 0,
+            fields: [1 | (3 << 32), 2 | (4 << 32), 0],
+        };
+        assert_eq!(a.texture(), (1, 3, 2, 4));
     }
 
     #[test]

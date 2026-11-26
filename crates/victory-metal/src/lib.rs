@@ -1,7 +1,7 @@
 //! The Metal side of the host seam ([`victory_host::Device`]), for Apple
 //! silicon.
 //!
-//! Slice 1: resources, heaps and descriptor heaps. [`format`] and
+//! Slice 1: resources, heaps, descriptor heaps, views and samplers. [`format`] and
 //! [`layout`] are portable (built and tested anywhere); the Metal calls
 //! are in `device`, macOS only.
 //!
@@ -17,7 +17,11 @@ pub mod layout;
 #[cfg(target_os = "macos")]
 mod device;
 #[cfg(target_os = "macos")]
+mod views;
+#[cfg(target_os = "macos")]
 pub use device::{MetalDescriptorHeap, MetalDevice, MetalResource};
+#[cfg(target_os = "macos")]
+pub use views::Target;
 
 /// Bytes of one entry in a descriptor table: Metal Shader Converter's
 /// `IRDescriptorTableEntry` (GPU address, texture view id, metadata), the

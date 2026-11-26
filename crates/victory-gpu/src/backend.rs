@@ -4,7 +4,15 @@
 //! the console-side code calls the trait and stays free of the D3D12
 //! device API, which a Metal backend then replaces.
 
-use victory_host::{Allocation, ClearValue, Descriptors, Device, HeapUse, Memory, ResourceDesc};
+use victory_host::{
+    Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
+    SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
+};
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_CONSTANT_BUFFER_VIEW_DESC, D3D12_CPU_DESCRIPTOR_HANDLE, D3D12_DEPTH_STENCIL_VIEW_DESC,
+    D3D12_RENDER_TARGET_VIEW_DESC, D3D12_SAMPLER_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC,
+};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_GPU_UPLOAD,
     D3D12_MEMORY_POOL_L0,
@@ -90,6 +98,33 @@ pub(crate) fn descriptors(kind: D3D12_DESCRIPTOR_HEAP_TYPE) -> Descriptors {
         D3D12_DESCRIPTOR_HEAP_TYPE_DSV => Descriptors::Depth,
         _ => Descriptors::Views,
     }
+}
+
+macro_rules! same_layout {
+    ($ours:ty, $d3d12:ty, $to:ident, $from:ident) => {
+        const _: () = assert!(size_of::<$ours>() == size_of::<$d3d12>());
+        const _: () = assert!(align_of::<$ours>() <= align_of::<$d3d12>());
+        /// The seam's description of a D3D12 one (same layout).
+        pub(crate) fn $from(desc: &$d3d12) -> &$ours {
+            // SAFETY: repr(C) with D3D12's fields at D3D12's offsets.
+            unsafe { &*(desc as *const $d3d12).cast::<$ours>() }
+        }
+        fn $to(desc: &$ours) -> &$d3d12 {
+            // SAFETY: as above; D3D12's alignment is at least ours and our
+            // values came from D3D12-shaped data.
+            unsafe { &*(desc as *const $ours).cast::<$d3d12>() }
+        }
+    };
+}
+
+same_layout!(ShaderViewDesc, D3D12_SHADER_RESOURCE_VIEW_DESC, to_srv, srv);
+same_layout!(UnorderedViewDesc, D3D12_UNORDERED_ACCESS_VIEW_DESC, to_uav, uav);
+same_layout!(TargetViewDesc, D3D12_RENDER_TARGET_VIEW_DESC, to_rtv, rtv);
+same_layout!(DepthViewDesc, D3D12_DEPTH_STENCIL_VIEW_DESC, to_dsv, dsv);
+same_layout!(SamplerDesc, D3D12_SAMPLER_DESC, to_sampler, sampler);
+
+fn handle(at: usize) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+    D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at }
 }
 
 /// The console description of a D3D12 one (same layout).
@@ -235,5 +270,82 @@ impl Device for D3d12<'_> {
     fn descriptor_step(&self, kind: Descriptors) -> u32 {
         // SAFETY: a plain query.
         unsafe { self.0.GetDescriptorHandleIncrementSize(descriptor_type(kind)) }
+    }
+
+    fn descriptor_start(&self, heap: &ID3D12DescriptorHeap) -> usize {
+        // SAFETY: a live heap.
+        unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr
+    }
+
+    unsafe fn shader_view(
+        &self,
+        resource: Option<&ID3D12Resource>,
+        desc: Option<&ShaderViewDesc>,
+        at: usize,
+    ) {
+        // SAFETY: the caller's slot; D3D12 checks the description.
+        unsafe {
+            self.0.CreateShaderResourceView(resource, desc.map(|d| std::ptr::from_ref(to_srv(d))), handle(at))
+        }
+    }
+
+    unsafe fn unordered_view(
+        &self,
+        resource: Option<&ID3D12Resource>,
+        desc: Option<&UnorderedViewDesc>,
+        at: usize,
+    ) {
+        // SAFETY: as above.
+        unsafe {
+            self.0.CreateUnorderedAccessView(
+                resource,
+                None::<&ID3D12Resource>,
+                desc.map(|d| std::ptr::from_ref(to_uav(d))),
+                handle(at),
+            )
+        }
+    }
+
+    unsafe fn constant_view(&self, address: u64, bytes: u32, at: usize) {
+        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: address,
+            SizeInBytes: bytes,
+        };
+        // SAFETY: as above.
+        unsafe { self.0.CreateConstantBufferView(Some(&desc), handle(at)) }
+    }
+
+    unsafe fn sampler(&self, desc: &SamplerDesc, at: usize) {
+        // SAFETY: as above.
+        unsafe { self.0.CreateSampler(to_sampler(desc), handle(at)) }
+    }
+
+    unsafe fn target_view(
+        &self,
+        resource: Option<&ID3D12Resource>,
+        desc: Option<&TargetViewDesc>,
+        at: usize,
+    ) {
+        // SAFETY: as above.
+        unsafe {
+            self.0.CreateRenderTargetView(resource, desc.map(|d| std::ptr::from_ref(to_rtv(d))), handle(at))
+        }
+    }
+
+    unsafe fn depth_view(
+        &self,
+        resource: Option<&ID3D12Resource>,
+        desc: Option<&DepthViewDesc>,
+        at: usize,
+    ) {
+        // SAFETY: as above.
+        unsafe {
+            self.0.CreateDepthStencilView(resource, desc.map(|d| std::ptr::from_ref(to_dsv(d))), handle(at))
+        }
+    }
+
+    unsafe fn copy_descriptors(&self, count: u32, to: usize, from: usize, kind: Descriptors) {
+        // SAFETY: the caller's ranges.
+        unsafe { self.0.CopyDescriptorsSimple(count, handle(to), handle(from), descriptor_type(kind)) }
     }
 }
