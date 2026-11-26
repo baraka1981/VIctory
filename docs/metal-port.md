@@ -19,16 +19,19 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 4. views + samplers in the seam (`shader_view` / `unordered_view` / `constant_view` / `sampler` / `target_view` / `depth_view` / `copy_descriptors` / `descriptor_start`). Descs are D3D12.X's layouts (`ShaderViewDesc` etc., size/align checked against D3D12's). All 23 production view writes in victory-gpu go through it.
 5. `victory-metal`: `Device` on Metal (objc2-metal). Format table (DXGI → MTLPixelFormat, numbers cross-checked vs objc2-metal), D3D12-rules copy layouts, private/shared storage by `Memory`, placement heaps, sparse heaps for reserved textures. Views write MSC-style table entries (buffer: addr/0/len, texture: 0/resource id/0, sampler: id/0/lod bias); texture views via `newTextureViewWithPixelFormat:...`, samplers via `MTLSamplerDescriptor` (argument buffer support on); objects a slot needs are kept alive per slot address; RTV/DSV slots remembered for render passes (`MetalDevice::target`). Portable bits unit-tested on Linux.
 
+6. slice 2a: `Recorder` trait (barriers, buffer/resource/texture copies) + `Device::copy_layout` (full footprints). D3D12: `backend::D3d12List`. Wired: submission preludes (`record_transitions`) and depth-twin copies (`record_twin_copy`). Metal: `MetalRecorder` (command buffer + blit encoder; transitions no-op, UAV barrier ends encoder), GPU round-trip test buffer -> texture -> buffer.
+
 ## Still direct D3D12 in victory-gpu
 
-- copy footprints *with layouts* (`texture.rs`, `texback.rs`, `host.rs` `record_twin_copy`) — they feed copy commands, move with slice 2
+- the remaining ~70 barriers and ~50 copies across host.rs / texture.rs / resource.rs / list.rs (helpers exist now: swap `ResourceBarrier`/`Copy*` for `D3d12List(list).…`); `HostList` itself still holds an `ID3D12GraphicsCommandList`
+- copy footprints with layouts in `texture.rs`, `texback.rs` (use `copy_layout`)
 - title-memory heaps (`inplace.rs`, OpenExistingHeapFromAddress) — Metal analogue: `newBufferWithBytesNoCopy` on page-aligned title memory. Big one for VRAM.
 - `CheckFeatureSupport` calls
 - diagnostics/probes (`capture.rs`, timestamps, `memory/*_probe.rs`) + GPU tests — fine to stay D3D12
 
 ## Next slices
 
-2. command recording: lists, barriers (no-op-ish on Metal), copies, draws/dispatch, footprints
+2. command recording: rest of barriers/copies (2a mechanics done), then 2b: lists themselves (`HostList` over `Recorder`), draws/dispatch, root bindings, clears
 3. pipelines + root signatures (MSC root signature → top-level argument buffer), tile mapping for sparse
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
 5. present (CAMetalLayer via winemac.drv's view) + MetalFX instead of FSR

@@ -4,7 +4,7 @@
 //! texel/block size) are looser, so a D3D12 layout is always a valid
 //! Metal one.
 
-use victory_host::{ResourceDesc, dimension};
+use victory_host::{Footprint as Placed, ResourceDesc, dimension};
 
 use crate::format::console_block;
 
@@ -101,6 +101,40 @@ pub fn copyable_bytes(desc: &ResourceDesc, first: u32, count: u32) -> Option<u64
     Some(total)
 }
 
+/// The seam's footprints of subresources `first..first + out.len()`,
+/// placed from offset 0, and the total bytes; `None` for formats without a
+/// byte layout. Widths and heights are in texels, as D3D12 reports them.
+pub fn layout(desc: &ResourceDesc, first: u32, out: &mut [Placed]) -> Option<u64> {
+    let mut next = 0;
+    let mut total = 0;
+    for (i, slot) in out.iter_mut().enumerate() {
+        let index = first + i as u32;
+        let f = footprint(desc, index, next)?;
+        let mip = index % mips(desc);
+        let block = console_block(desc.format).unwrap_or(crate::format::Block { bytes: 1, width: 1, height: 1 });
+        *slot = Placed {
+            offset: f.offset,
+            format: desc.format,
+            width: if desc.dimension == dimension::BUFFER {
+                desc.width as u32
+            } else {
+                ((desc.width >> mip).max(1) as u32).next_multiple_of(block.width)
+            },
+            height: if desc.dimension == dimension::BUFFER {
+                1
+            } else {
+                f.rows * block.height
+            },
+            depth: f.depth,
+            row_pitch: f.row_pitch as u32,
+        };
+        let rows = u64::from(f.rows) * u64::from(f.depth);
+        total = f.offset + f.row_pitch * (rows - 1) + f.row_bytes;
+        next = f.offset + f.row_pitch * rows;
+    }
+    Some(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +192,19 @@ mod tests {
         let d = texture(4, 4, 20, 1);
         assert_eq!(footprint(&d, 0, 0).unwrap().row_bytes, 16);
         assert_eq!(footprint(&d, 1, 0).unwrap().row_bytes, 4);
+    }
+
+    #[test]
+    fn layout_places_each_mip() {
+        let d = texture(256, 256, 28, 2);
+        let mut out = [Placed::default(); 2];
+        assert_eq!(layout(&d, 0, &mut out), copyable_bytes(&d, 0, 2));
+        assert_eq!((out[0].offset, out[0].width, out[0].height, out[0].row_pitch), (0, 256, 256, 1024));
+        assert_eq!((out[1].offset, out[1].width, out[1].height, out[1].row_pitch), (262_144, 128, 128, 512));
+        // BC: widths and heights round up to whole blocks.
+        let mut bc = [Placed::default(); 1];
+        layout(&texture(6, 6, 71, 1), 0, &mut bc);
+        assert_eq!((bc[0].width, bc[0].height), (8, 8));
     }
 
     #[test]

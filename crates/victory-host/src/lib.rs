@@ -241,6 +241,108 @@ impl UnorderedViewDesc {
     }
 }
 
+/// Where one subresource lies in a buffer laid out for a copy
+/// (`D3D12_PLACED_SUBRESOURCE_FOOTPRINT`).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Footprint {
+    pub offset: u64,
+    pub format: u32,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub row_pitch: u32,
+}
+
+const _: () = assert!(size_of::<Footprint>() == 32);
+
+/// A box of texels (`D3D12_BOX`): left, top, front inclusive; right,
+/// bottom, back exclusive.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub left: u32,
+    pub top: u32,
+    pub front: u32,
+    pub right: u32,
+    pub bottom: u32,
+    pub back: u32,
+}
+
+/// One end of a texture copy.
+#[derive(Debug, Clone, Copy)]
+pub enum Location<'a, R> {
+    /// Subresource `index` of a texture (mip + slice * mips + plane * ...).
+    Subresource(&'a R, u32),
+    /// A buffer region laid out as `Footprint` says.
+    Footprint(&'a R, Footprint),
+}
+
+/// Every subresource, in a transition barrier.
+pub const ALL_SUBRESOURCES: u32 = u32::MAX;
+
+/// An ordering point between commands of one list.
+#[derive(Debug, Clone, Copy)]
+pub enum Barrier<'a, R> {
+    /// `resource` (or one subresource) moves from state `before` to `after`
+    /// (D3D12 numbering). Backends that track hazards themselves (Metal)
+    /// may record nothing.
+    Transition {
+        resource: &'a R,
+        subresource: u32,
+        before: u32,
+        after: u32,
+    },
+    /// Unordered-access writes to `resource` (any, when `None`) finish
+    /// before later commands read or write it.
+    Unordered(Option<&'a R>),
+    /// `after` starts using memory `before` used (placed resources).
+    Aliasing(Option<&'a R>, Option<&'a R>),
+}
+
+/// Recording into one open command list (slice 2a: barriers and copies).
+/// Methods are unsafe: the caller keeps the list open and every resource
+/// alive until the list has run, and ranges inside their resources.
+pub trait Recorder {
+    type Resource;
+
+    /// # Safety
+    /// See the trait.
+    unsafe fn barriers(&self, barriers: &[Barrier<'_, Self::Resource>]);
+
+    /// `bytes` from `from` at `from_offset` to `to` at `to_offset`.
+    ///
+    /// # Safety
+    /// See the trait.
+    unsafe fn copy_buffer(
+        &self,
+        to: &Self::Resource,
+        to_offset: u64,
+        from: &Self::Resource,
+        from_offset: u64,
+        bytes: u64,
+    );
+
+    /// The whole of `from` to `to` (same shape).
+    ///
+    /// # Safety
+    /// See the trait.
+    unsafe fn copy_resource(&self, to: &Self::Resource, from: &Self::Resource);
+
+    /// `region` of `from` (all of it when `None`) to `to` at texel `at`.
+    /// At least one end is a texture subresource.
+    ///
+    /// # Safety
+    /// See the trait.
+    unsafe fn copy_texture(
+        &self,
+        to: Location<'_, Self::Resource>,
+        at: [u32; 3],
+        from: Location<'_, Self::Resource>,
+        region: Option<&Region>,
+    );
+}
+
 /// What a host graphics API provides the console side (slice 1).
 ///
 /// Methods take `&self` and are called from the title's threads at once:
@@ -370,6 +472,11 @@ pub trait Device {
         desc: Option<&DepthViewDesc>,
         at: usize,
     );
+
+    /// Copy footprints of subresources `first..first + count` of `desc`,
+    /// one per entry of `out` (its length is `count`), placed from offset
+    /// 0; returns the total bytes (as [`Device::copyable_bytes`]).
+    fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [Footprint]) -> u64;
 
     /// Copies `count` descriptors of `kind` from `from` to `to`.
     ///

@@ -7,7 +7,7 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
+    MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
     MTLPixelFormat, MTLResourceOptions, MTLSamplerState, MTLStorageMode, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
@@ -16,6 +16,7 @@ use victory_host::{
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, dimension, flags, view,
 };
 
+use crate::record::MetalRecorder;
 use crate::views::{self, Kept, Slots, Target, resource_id};
 use crate::{DESCRIPTOR_BYTES, MetalError, format, layout};
 
@@ -42,16 +43,25 @@ pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Metal objects descriptor slots refer to, by slot address.
     slots: Slots,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
 impl MetalDevice {
     /// The system's default GPU (the only one on Apple silicon).
     pub fn system_default() -> Result<MetalDevice, MetalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
+        let queue = device.newCommandQueue().ok_or(MetalError::Failed("a command queue"))?;
         Ok(MetalDevice {
             device,
             slots: Slots::default(),
+            queue,
         })
+    }
+
+    /// A new command buffer to record into.
+    pub fn recorder(&self) -> Result<MetalRecorder, MetalError> {
+        let buffer = self.queue.commandBuffer().ok_or(MetalError::Failed("a command buffer"))?;
+        Ok(MetalRecorder::new(buffer))
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -298,6 +308,10 @@ impl Device for MetalDevice {
         DESCRIPTOR_BYTES
     }
 
+    fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [victory_host::Footprint]) -> u64 {
+        layout::layout(desc, first, out).unwrap_or(0)
+    }
+
     fn descriptor_start(&self, heap: &MetalDescriptorHeap) -> usize {
         heap.table.contents().as_ptr() as usize
     }
@@ -542,6 +556,49 @@ mod tests {
         let at = gpu.descriptor_start(&targets);
         unsafe { gpu.target_view(Some(&rt), None, at) };
         assert!(gpu.target(at).is_some());
+    }
+
+    #[test]
+    fn copies_round_trip_through_a_texture() {
+        use victory_host::{Footprint, Location, Recorder as _};
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        // 16x16 RGBA8: 64 bytes a row, laid out with 256-byte rows.
+        let desc = texture(16, 16, 28, 0);
+        let desc = ResourceDesc { mip_levels: 1, ..desc };
+        let mut rows = [Footprint::default(); 1];
+        let total = gpu.copy_layout(&desc, 0, &mut rows);
+        assert_eq!((rows[0].row_pitch, rows[0].height, total), (256, 16, 256 * 15 + 64));
+
+        let upload = gpu.committed(Memory::Upload, &ResourceDesc::buffer(total, 0), state::GENERIC_READ, None).unwrap();
+        let staging = gpu.committed(Memory::Device, &ResourceDesc::buffer(total, 0), state::COMMON, None).unwrap();
+        let back = gpu.committed(Memory::Readback, &ResourceDesc::buffer(total, 0), state::COPY_DEST, None).unwrap();
+        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
+        let (MetalResource::Buffer(up), MetalResource::Buffer(rb)) = (&upload, &back) else { unreachable!() };
+        // Each texel's bytes: its x, its y, 7, 255.
+        let at = up.contents().as_ptr().cast::<u8>();
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let p = y * 256 + x * 4;
+                unsafe { at.add(p).copy_from([x as u8, y as u8, 7, 255].as_ptr(), 4) };
+            }
+        }
+
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.copy_buffer(&staging, 0, &upload, 0, total);
+            rec.copy_texture(Location::Subresource(&tex, 0), [0; 3], Location::Footprint(&staging, rows[0]), None);
+            rec.copy_texture(Location::Footprint(&back, rows[0]), [0; 3], Location::Subresource(&tex, 0), None);
+        }
+        rec.commit_and_wait().expect("the copies run");
+
+        let got = rb.contents().as_ptr().cast::<u8>();
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let mut texel = [0u8; 4];
+                unsafe { got.add(y * 256 + x * 4).copy_to(texel.as_mut_ptr(), 4) };
+                assert_eq!(texel, [x as u8, y as u8, 7, 255], "texel {x},{y}");
+            }
+        }
     }
 
     #[test]

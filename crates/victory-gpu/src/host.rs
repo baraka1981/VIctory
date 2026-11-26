@@ -24,7 +24,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
-use victory_host::{Descriptors, Device as _, Memory};
+use victory_host::{Barrier, Descriptors, Device as _, Location, Memory, Recorder as _};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -990,11 +990,17 @@ fn record_transitions(list: &ID3D12GraphicsCommandList, transitions: &[PreludeTr
     if transitions.is_empty() {
         return;
     }
-    let barriers: Vec<_> = transitions.iter().map(|PreludeTransition(texture, from, to)| {
-        transition(texture, D3D12_RESOURCE_STATES(*from as i32), D3D12_RESOURCE_STATES(*to as i32))
-    }).collect();
+    let barriers: Vec<_> = transitions
+        .iter()
+        .map(|PreludeTransition(texture, from, to)| Barrier::Transition {
+            resource: texture,
+            subresource: victory_host::ALL_SUBRESOURCES,
+            before: *from,
+            after: *to,
+        })
+        .collect();
     // SAFETY: the list is open and the transitions own their resources.
-    unsafe { list.ResourceBarrier(&barriers) };
+    unsafe { crate::backend::D3d12List(list).barriers(&barriers) };
 }
 
 struct PlannedPrelude {
@@ -1438,9 +1444,10 @@ fn record_twin_copy(
     if colour && twin.plane.is_some() {
         crate::resource::PLANES[1].fetch_add(1, Ordering::Relaxed);
     }
+    let rec = crate::backend::D3d12List(list);
     let Some(through) = &twin.through else {
         // SAFETY: an open list and two live textures.
-        unsafe { list.CopyResource(to, from) };
+        unsafe { rec.copy_resource(to, from) };
         return;
     };
     // A stencil plane and its twin: each mip and slice of the plane goes
@@ -1452,56 +1459,30 @@ fn record_twin_copy(
     // SAFETY: a live texture.
     let of = unsafe { depth.GetDesc() };
     let planes = u32::from(of.MipLevels) * u32::from(of.DepthOrArraySize);
-    let mut rows = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); planes as usize];
-    // SAFETY: a plain query writing `planes` footprints.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &of,
-            planes,
-            planes,
-            0,
-            Some(rows.as_mut_ptr()),
-            None,
-            None,
-            None,
-        );
-    }
+    let mut rows = vec![victory_host::Footprint::default(); planes as usize];
+    host.gpu().copy_layout(&crate::backend::console_desc(&of), planes, &mut rows);
     let (first_from, first_to) = if colour { (planes, 0) } else { (0, planes) };
-    let subresource = |texture: &ID3D12Resource, index: u32| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: a borrowed pointer the location never releases.
-        pResource: unsafe { std::mem::transmute_copy(texture) },
-        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            SubresourceIndex: index,
-        },
-    };
-    let placed = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
-        // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(through) },
-        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-            PlacedFootprint: *row,
-        },
-    };
     let (common, source, dest) = (
-        D3D12_RESOURCE_STATE_COMMON,
-        D3D12_RESOURCE_STATE_COPY_SOURCE,
-        D3D12_RESOURCE_STATE_COPY_DEST,
+        victory_host::state::COMMON,
+        D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32,
+        victory_host::state::COPY_DEST,
     );
+    let all = victory_host::ALL_SUBRESOURCES;
+    let moved = |before, after| Barrier::Transition { resource: through, subresource: all, before, after };
     // SAFETY: an open list and live resources; the buffer was made as big
     // as these footprints, and rests in the common state between copies.
     unsafe {
-        list.ResourceBarrier(&[transition(through, common, dest)]);
+        rec.barriers(&[moved(common, dest)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_from + i as u32;
-            list.CopyTextureRegion(&placed(row), 0, 0, 0, &subresource(from, index), None);
+            rec.copy_texture(Location::Footprint(through, *row), [0; 3], Location::Subresource(from, index), None);
         }
-        list.ResourceBarrier(&[transition(through, dest, source)]);
+        rec.barriers(&[moved(dest, source)]);
         for (i, row) in rows.iter().enumerate() {
             let index = first_to + i as u32;
-            list.CopyTextureRegion(&subresource(to, index), 0, 0, 0, &placed(row), None);
+            rec.copy_texture(Location::Subresource(to, index), [0; 3], Location::Footprint(through, *row), None);
         }
-        list.ResourceBarrier(&[transition(through, source, common)]);
+        rec.barriers(&[moved(source, common)]);
     }
 }
 
