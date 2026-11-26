@@ -300,6 +300,51 @@ pub enum Barrier<'a, R> {
     Aliasing(Option<&'a R>, Option<&'a R>),
 }
 
+/// Shader code in a form one backend takes.
+#[derive(Debug, Clone, Copy)]
+pub enum ShaderCode<'a> {
+    /// A DXIL container (what victory-shader emits). D3D12 takes it as is;
+    /// Metal needs it converted first (Metal Shader Converter, slice 3b).
+    Dxil(&'a [u8]),
+    /// Metal Shading Language source (Metal only: the backend's own
+    /// helper shaders).
+    Msl(&'a str),
+    /// A compiled Metal library (Metal only).
+    MetalLib(&'a [u8]),
+}
+
+/// A compute pipeline with the simple binding model slice 3a supports:
+/// 32-bit constants first, then one buffer per binding, in order.
+///
+/// D3D12: `root_signature` is a serialized root signature whose parameter
+/// 0 is the constants and parameters 1.. root SRVs/UAVs matching the
+/// bindings. Metal: constants are buffer index 0, bindings 1..
+#[derive(Debug, Clone, Copy)]
+pub struct ComputeDesc<'a> {
+    pub code: ShaderCode<'a>,
+    /// Entry point name (Metal; D3D12 takes the container's).
+    pub entry: &'a str,
+    pub root_signature: &'a [u8],
+    /// Threads per group, as the shader declares them.
+    pub threads: [u32; 3],
+}
+
+/// A buffer bound for a dispatch.
+#[derive(Debug)]
+pub enum Binding<'a, R> {
+    /// Read-only (D3D12 root SRV) from `offset`.
+    Read(&'a R, u64),
+    /// Read-write (D3D12 root UAV) from `offset`.
+    Write(&'a R, u64),
+}
+
+impl<R> Clone for Binding<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for Binding<'_, R> {}
+
 // Both hold only references: copyable whatever the resource type is.
 impl<R> Clone for Location<'_, R> {
     fn clone(&self) -> Self {
@@ -319,6 +364,20 @@ impl<R> Copy for Barrier<'_, R> {}
 /// alive until the list has run, and ranges inside their resources.
 pub trait Recorder {
     type Resource;
+    type Pipeline;
+
+    /// Runs `pipeline` over `groups` thread groups with `constants` and
+    /// `bindings` (see [`ComputeDesc`]).
+    ///
+    /// # Safety
+    /// See the trait; the bindings stay inside their buffers.
+    unsafe fn dispatch(
+        &self,
+        pipeline: &Self::Pipeline,
+        constants: &[u32],
+        bindings: &[Binding<'_, Self::Resource>],
+        groups: [u32; 3],
+    );
 
     /// # Safety
     /// See the trait.
@@ -369,6 +428,8 @@ pub trait Device {
     type Heap;
     /// A block of descriptors (D3D12 descriptor heap, Metal argument table).
     type DescriptorHeap;
+    /// A compiled compute pipeline.
+    type Pipeline;
     type Error: fmt::Display + fmt::Debug;
 
     /// A resource with memory of its own, in `state` (D3D12 numbering),
@@ -486,6 +547,9 @@ pub trait Device {
         desc: Option<&DepthViewDesc>,
         at: usize,
     );
+
+    /// A compute pipeline (slice 3a's binding model, [`ComputeDesc`]).
+    fn compute_pipeline(&self, desc: &ComputeDesc<'_>) -> Result<Self::Pipeline, Self::Error>;
 
     /// Copy footprints of subresources `first..first + count` of `desc`,
     /// one per entry of `out` (its length is `count`), placed from offset

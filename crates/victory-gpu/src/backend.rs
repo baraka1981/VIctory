@@ -5,6 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
+    Binding, ComputeDesc, ShaderCode,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -19,6 +20,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_TEXTURE_COPY_LOCATION,
     D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
     D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, ID3D12GraphicsCommandList,
+    D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, ID3D12PipelineState,
+    ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_HEAP_TYPE_CUSTOM, D3D12_HEAP_TYPE_GPU_UPLOAD,
@@ -254,12 +257,45 @@ pub(crate) fn rec(list: &ID3D12GraphicsCommandList) -> D3d12List<'_> {
     D3d12List(list)
 }
 
+/// A compute pipeline: its root signature and state.
+pub(crate) struct D3d12Pipeline {
+    pub(crate) root: ID3D12RootSignature,
+    pub(crate) state: ID3D12PipelineState,
+}
+
 /// A D3D12 command list seen through the host seam.
 #[derive(Clone, Copy)]
 pub(crate) struct D3d12List<'a>(pub(crate) &'a ID3D12GraphicsCommandList);
 
 impl Recorder for D3d12List<'_> {
     type Resource = ID3D12Resource;
+    type Pipeline = D3d12Pipeline;
+
+    unsafe fn dispatch(
+        &self,
+        pipeline: &D3d12Pipeline,
+        constants: &[u32],
+        bindings: &[Binding<'_, ID3D12Resource>],
+        groups: [u32; 3],
+    ) {
+        // SAFETY: the caller's open list, live resources and ranges; the
+        // root signature's parameters follow ComputeDesc's model.
+        unsafe {
+            self.0.SetComputeRootSignature(&pipeline.root);
+            self.0.SetPipelineState(&pipeline.state);
+            if !constants.is_empty() {
+                self.0.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
+            }
+            for (i, b) in bindings.iter().enumerate() {
+                let slot = i as u32 + 1;
+                match *b {
+                    Binding::Read(r, offset) => self.0.SetComputeRootShaderResourceView(slot, r.GetGPUVirtualAddress() + offset),
+                    Binding::Write(r, offset) => self.0.SetComputeRootUnorderedAccessView(slot, r.GetGPUVirtualAddress() + offset),
+                }
+            }
+            self.0.Dispatch(groups[0], groups[1], groups[2]);
+        }
+    }
 
     unsafe fn barriers(&self, barriers: &[Barrier<'_, ID3D12Resource>]) {
         if barriers.is_empty() {
@@ -308,6 +344,7 @@ pub(crate) fn console_desc(desc: &D3D12_RESOURCE_DESC) -> ResourceDesc {
 impl Device for D3d12<'_> {
     type Resource = ID3D12Resource;
     type Heap = ID3D12Heap;
+    type Pipeline = D3d12Pipeline;
     type DescriptorHeap = ID3D12DescriptorHeap;
     type Error = windows::core::Error;
 
@@ -442,6 +479,26 @@ impl Device for D3d12<'_> {
     fn descriptor_step(&self, kind: Descriptors) -> u32 {
         // SAFETY: a plain query.
         unsafe { self.0.GetDescriptorHandleIncrementSize(descriptor_type(kind)) }
+    }
+
+    fn compute_pipeline(&self, desc: &ComputeDesc<'_>) -> windows::core::Result<D3d12Pipeline> {
+        let ShaderCode::Dxil(code) = desc.code else {
+            return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
+        };
+        // SAFETY: a serialized root signature and a DXIL container; D3D12
+        // validates both.
+        unsafe {
+            let root: ID3D12RootSignature = self.0.CreateRootSignature(0, desc.root_signature)?;
+            let state: ID3D12PipelineState = self.0.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(&root))),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            })?;
+            Ok(D3d12Pipeline { root, state })
+        }
     }
 
     fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [Footprint]) -> u64 {

@@ -21,6 +21,8 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 
 6. slice 2a: `Recorder` trait (barriers, buffer/resource/texture copies) + `Device::copy_layout` (full footprints). D3D12: `backend::D3d12List`. Wired: submission preludes (`record_transitions`) and depth-twin copies (`record_twin_copy`). Metal: `MetalRecorder` (command buffer + blit encoder; transitions no-op, UAV barrier ends encoder), GPU round-trip test buffer -> texture -> buffer.
 
+7. slice 3a: `ShaderCode` (DXIL / MSL / metallib), `ComputeDesc` (constants at param/index 0, one buffer per binding after), `Device::compute_pipeline`, `Recorder::dispatch`. D3D12: root signature + compute PSO from DXIL. Metal: pipelines from MSL or metallib, compute encoder per dispatch; GPU test runs a real kernel. DXIL on Metal refused until 3b.
+
 ## Still direct D3D12 in victory-gpu
 
 - barriers + copies: all production ones go through `Recorder` now (`record_barriers`, `rec(list).copy_*`, with `barrier_of` / `location_of` converting D3D12-built structs). Left direct: diagnostics (`capture.rs`), probes + test helpers (`memory/*`), GPU tests. Next cleanup: build `Barrier`/`Location` at the call sites instead of converting.
@@ -33,7 +35,7 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 ## Next slices
 
 2. ~~2a barriers/copies~~ done. **Order from here: slice 3 before 2b** — Metal can't record a draw or dispatch without a pipeline, so pipelines + root signatures come first.
-3. pipelines + root signatures (MSC root signature → top-level argument buffer), tile mapping for sparse
+3. ~~3a compute pipelines + dispatch~~ done. 3b: Metal Shader Converter (`libmetalirconverter.dylib`, Apple developer download) loaded at runtime: DXIL -> metallib, root signature -> top-level argument buffer; then graphics pipelines, and moving victory-gpu's 11 compute PSOs / 14 root signatures onto the seam. Tile mapping for sparse.
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
 5. present (CAMetalLayer via winemac.drv's view) + MetalFX instead of FSR
 

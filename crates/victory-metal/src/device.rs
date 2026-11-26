@@ -7,11 +7,13 @@
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
+    MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLLibrary, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
     MTLPixelFormat, MTLResourceOptions, MTLSamplerState, MTLStorageMode, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
 };
+use objc2_foundation::{NSString, NSURL};
 use victory_host::{
+    ComputeDesc, ShaderCode,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, dimension, flags, view,
 };
@@ -37,6 +39,12 @@ pub struct MetalDescriptorHeap {
     pub kind: Descriptors,
     pub count: u32,
     pub table: Buffer,
+}
+
+/// A compute pipeline and the group size its shader declares.
+pub struct MetalPipeline {
+    pub state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pub threads: [u32; 3],
 }
 
 pub struct MetalDevice {
@@ -91,6 +99,11 @@ impl MetalDevice {
             None => ([0; 3], None),
         }
     }
+}
+
+/// A short hash for temporary file names.
+fn fxhash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
 }
 
 fn storage(memory: Memory) -> MTLStorageMode {
@@ -175,6 +188,7 @@ impl Device for MetalDevice {
     type Resource = MetalResource;
     type Heap = Heap;
     type DescriptorHeap = MetalDescriptorHeap;
+    type Pipeline = MetalPipeline;
     type Error = MetalError;
 
     fn committed(
@@ -306,6 +320,34 @@ impl Device for MetalDevice {
 
     fn descriptor_step(&self, _kind: Descriptors) -> u32 {
         DESCRIPTOR_BYTES
+    }
+
+    fn compute_pipeline(&self, desc: &ComputeDesc<'_>) -> Result<MetalPipeline, MetalError> {
+        let shader = |e: Retained<objc2_foundation::NSError>| MetalError::Shader(e.localizedDescription().to_string());
+        let library: Retained<ProtocolObject<dyn MTLLibrary>> = match desc.code {
+            ShaderCode::Msl(source) => self
+                .device
+                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+                .map_err(shader)?,
+            ShaderCode::MetalLib(bytes) => {
+                // Metal reads libraries from files or dispatch data; a file
+                // keeps this free of libdispatch bindings.
+                let path = std::env::temp_dir().join(format!("victory-{:x}.metallib", fxhash(bytes)));
+                std::fs::write(&path, bytes).map_err(|e| MetalError::Shader(e.to_string()))?;
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+                let made = self.device.newLibraryWithURL_error(&url).map_err(shader);
+                let _ = std::fs::remove_file(&path);
+                made?
+            }
+            ShaderCode::Dxil(_) => {
+                return Err(MetalError::Shader("DXIL needs Metal Shader Converter (slice 3b)".into()));
+            }
+        };
+        let function = library
+            .newFunctionWithName(&NSString::from_str(desc.entry))
+            .ok_or_else(|| MetalError::Shader(format!("no function {}", desc.entry)))?;
+        let state = self.device.newComputePipelineStateWithFunction_error(&function).map_err(shader)?;
+        Ok(MetalPipeline { state, threads: desc.threads })
     }
 
     fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [victory_host::Footprint]) -> u64 {
@@ -599,6 +641,38 @@ mod tests {
                 assert_eq!(texel, [x as u8, y as u8, 7, 255], "texel {x},{y}");
             }
         }
+    }
+
+    #[test]
+    fn compute_dispatch_runs_on_the_gpu() {
+        use victory_host::{Binding, ComputeDesc, Recorder as _, ShaderCode};
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let source = "#include <metal_stdlib>\nusing namespace metal;\n\
+            kernel void add(constant uint& base [[buffer(0)]], device const uint* input [[buffer(1)]],\n\
+                            device uint* out [[buffer(2)]], uint id [[thread_position_in_grid]]) {\n\
+                out[id] = input[id] * 2 + base;\n\
+            }\n";
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc { code: ShaderCode::Msl(source), entry: "add", root_signature: &[], threads: [64, 1, 1] })
+            .expect("the shader compiles");
+        let bytes = 256 * 4;
+        let input = gpu.committed(Memory::Upload, &ResourceDesc::buffer(bytes, 0), state::GENERIC_READ, None).unwrap();
+        let out = gpu.committed(Memory::Shared, &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS), state::COMMON, None).unwrap();
+        let (MetalResource::Buffer(i), MetalResource::Buffer(o)) = (&input, &out) else { unreachable!() };
+        let values = i.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            unsafe { values.add(n).write(n as u32) };
+        }
+        let rec = gpu.recorder().unwrap();
+        unsafe { rec.dispatch(&pipeline, &[1000], &[Binding::Read(&input, 0), Binding::Write(&out, 0)], [4, 1, 1]) };
+        rec.commit_and_wait().expect("the dispatch runs");
+        let got = o.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            assert_eq!(unsafe { got.add(n).read() }, n as u32 * 2 + 1000, "element {n}");
+        }
+        // DXIL is refused until Metal Shader Converter is wired in.
+        let dxil = gpu.compute_pipeline(&ComputeDesc { code: ShaderCode::Dxil(b"DXBC"), entry: "main", root_signature: &[], threads: [1, 1, 1] });
+        assert!(matches!(dxil, Err(MetalError::Shader(_))));
     }
 
     #[test]

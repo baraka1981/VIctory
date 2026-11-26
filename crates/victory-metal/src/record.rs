@@ -10,13 +10,14 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
+    MTLComputeCommandEncoder,
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLOrigin, MTLSize,
     MTLTexture,
 };
-use victory_host::{Barrier, Location, Recorder, Region};
+use victory_host::{Barrier, Binding, Location, Recorder, Region};
 
 use crate::MetalError;
-use crate::device::MetalResource;
+use crate::device::{MetalPipeline, MetalResource};
 use crate::format::console_block;
 
 type Encoder = Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>;
@@ -109,6 +110,35 @@ fn span(region: Option<&Region>, whole: MTLSize) -> (MTLOrigin, MTLSize) {
 
 impl Recorder for MetalRecorder {
     type Resource = MetalResource;
+    type Pipeline = MetalPipeline;
+
+    /// One compute encoder per dispatch: constants at buffer index 0,
+    /// bindings from 1 (ComputeDesc's model).
+    unsafe fn dispatch(
+        &self,
+        pipeline: &MetalPipeline,
+        constants: &[u32],
+        bindings: &[Binding<'_, MetalResource>],
+        groups: [u32; 3],
+    ) {
+        self.end();
+        let Some(enc) = self.buffer.computeCommandEncoder() else { return };
+        enc.setComputePipelineState(&pipeline.state);
+        // SAFETY: the constants outlive the call (Metal copies them); the
+        // caller keeps bindings inside their buffers.
+        unsafe {
+            if let Some(first) = constants.first() {
+                enc.setBytes_length_atIndex(std::ptr::NonNull::from(first).cast(), constants.len() * 4, 0);
+            }
+            for (i, b) in bindings.iter().enumerate() {
+                let (Binding::Read(r, offset) | Binding::Write(r, offset)) = *b;
+                enc.setBuffer_offset_atIndex(buffer(r), offset as usize, i + 1);
+            }
+        }
+        let size = |v: [u32; 3]| MTLSize { width: v[0] as usize, height: v[1] as usize, depth: v[2] as usize };
+        enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(pipeline.threads));
+        enc.endEncoding();
+    }
 
     unsafe fn barriers(&self, barriers: &[Barrier<'_, MetalResource>]) {
         if barriers.iter().any(|b| matches!(b, Barrier::Unordered(_))) {

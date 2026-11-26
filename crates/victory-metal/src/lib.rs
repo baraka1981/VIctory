@@ -2,7 +2,8 @@
 //! silicon.
 //!
 //! Slice 1: resources, heaps, descriptor heaps, views and samplers.
-//! Slice 2a: recording barriers and copies ([`MetalRecorder`]). [`format`] and
+//! Slice 2a: recording barriers and copies ([`MetalRecorder`]).
+//! Slice 3a: compute pipelines from MSL or a metallib, and dispatch. [`format`] and
 //! [`layout`] are portable (built and tested anywhere); the Metal calls
 //! are in `device`, macOS only.
 //!
@@ -22,7 +23,7 @@ mod record;
 #[cfg(target_os = "macos")]
 mod views;
 #[cfg(target_os = "macos")]
-pub use device::{MetalDescriptorHeap, MetalDevice, MetalResource};
+pub use device::{MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource};
 #[cfg(target_os = "macos")]
 pub use record::MetalRecorder;
 #[cfg(target_os = "macos")]
@@ -43,6 +44,9 @@ pub enum MetalError {
     Dimension(u32),
     /// Metal returned nil: out of memory, or a heap is full.
     Failed(&'static str),
+    /// A shader Metal could not take (its message), or code in a form
+    /// this backend does not take yet (DXIL before Metal Shader Converter).
+    Shader(String),
 }
 
 impl fmt::Display for MetalError {
@@ -52,6 +56,7 @@ impl fmt::Display for MetalError {
             MetalError::Format(n) => write!(f, "format {n} has no Metal match"),
             MetalError::Dimension(n) => write!(f, "resource dimension {n} has no Metal match"),
             MetalError::Failed(what) => write!(f, "Metal could not make {what}"),
+            MetalError::Shader(why) => write!(f, "shader: {why}"),
         }
     }
 }
