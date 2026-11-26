@@ -3,10 +3,14 @@
 //! Every command reads the user's own files and writes only to stdout or to
 //! the user's cache directory (outside the repository).
 
+// Off Windows the host commands are left out; what only they use is dead there.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 mod census;
 mod inspect;
 mod run;
 mod shader;
+#[cfg(windows)]
 mod translate;
 
 use std::path::PathBuf;
@@ -233,10 +237,22 @@ fn main() -> Result<()> {
             if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_host_max_wave(n);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            #[cfg(windows)]
+            return translate::run(paths, validate, pipelines, list, jobs);
+            #[cfg(not(windows))]
+            {
+                let _ = (paths, validate, pipelines, list, jobs);
+                anyhow::bail!("translate needs the Windows host (D3D12 validation)")
+            }
         }
         Command::Warm { rays, paths, jobs, no_pipelines } => {
-            translate::warm(paths, jobs, !no_pipelines, rays)
+            #[cfg(windows)]
+            return translate::warm(paths, jobs, !no_pipelines, rays);
+            #[cfg(not(windows))]
+            {
+                let _ = (rays, paths, jobs, no_pipelines);
+                anyhow::bail!("warm needs the Windows host")
+            }
         }
         Command::Run {
             rays,

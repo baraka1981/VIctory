@@ -1803,6 +1803,21 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
+        // Without a host there is no way to probe title memory: treat it
+        // like an unreadable page below (met).
+        #[cfg(not(windows))]
+        {
+            let _ = bytes;
+            true
+        }
+        #[cfg(windows)]
+        self.holds_probed(bytes)
+    }
+
+    /// [`Self::holds`] past the null check: reads the waited-for value,
+    /// treating an unreadable or (when asked) uncommitted page as met.
+    #[cfg(windows)]
+    fn holds_probed(&self, bytes: usize) -> bool {
         static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
             && !crate::texture::committed(self.address as *const u8, bytes)

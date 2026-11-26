@@ -81,10 +81,14 @@ extern "system" fn launch_new_game(
         .unwrap_or_default();
     let ours: Vec<_> = std::env::args_os().skip(1).collect();
     let command = relaunch_args(ours, current.as_os_str(), &exe, &args);
+    #[cfg(windows)]
     super::lifecycle::end_title(
         "XLaunchNewGame",
         Box::new(move || super::lifecycle::relaunch(command)),
     );
+    // No host lifecycle to hand the relaunch to: the title just stops here.
+    #[cfg(not(windows))]
+    tracing::error!(?command, "XLaunchNewGame: relaunch needs the Windows host");
     loop {
         std::thread::park();
     }

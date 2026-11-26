@@ -11,6 +11,9 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+// Off Windows only the host-free parts build; what only the host uses is dead there.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports, unused_variables, unused_mut))]
+
 mod host;
 pub mod modules;
 mod registry;
