@@ -368,9 +368,9 @@ impl RootSignature {
         out
     }
 
-    /// Serialized as D3D12 does (dxc's byte order), in a DXBC container.
-    /// The container hash is left zero: this is for tests and for the
-    /// backends that read the blob themselves (Metal), not for D3D12.
+    /// Serialized as D3D12 does (dxc's byte order), in a signed DXBC
+    /// container ([`crate::dxbc`]): what `D3D12SerializeVersionedRootSignature`
+    /// returns, made without D3D12.
     pub fn serialize(&self) -> Vec<u8> {
         let v11 = self.version == Version::V1_1;
         let mut part: Vec<u32> = vec![
@@ -458,6 +458,7 @@ impl RootSignature {
         for w in part {
             out.extend_from_slice(&w.to_le_bytes());
         }
+        crate::dxbc::sign(&mut out);
         out
     }
 }
@@ -668,12 +669,10 @@ mod tests {
 
     #[test]
     fn serializes_as_dxc_does() {
-        // Everything but the container hash, which is left zero.
+        // Byte for byte, the container checksum included.
         for blob in [&samples::RS10[..], &samples::RS11[..]] {
             let made = parse(blob).unwrap().serialize();
-            assert_eq!(made.len(), blob.len());
-            assert_eq!(made[..4], blob[..4]);
-            assert_eq!(made[20..], blob[20..]);
+            assert_eq!(made, blob);
             assert_eq!(parse(&made).unwrap(), parse(blob).unwrap());
         }
     }

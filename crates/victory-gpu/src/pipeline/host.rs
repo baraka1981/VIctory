@@ -9,7 +9,6 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
@@ -422,14 +421,15 @@ impl HostPipeline {
         }
         let host = host()?;
 
-        // The root signature the translated shaders' bindings define.
-        let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
-        // The ranges table parameters point at, alive until the root
-        // signature is made.
-        let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
+        // The root signature the translated shaders' bindings define,
+        // made without D3D12 (victory_host::root), so the Metal backend
+        // takes the same bytes.
+        use victory_host::root::{self as rs, Kind, Parameter, Range};
+        let mut params: Vec<Parameter> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
+            let visibility = visibility.0 as u32;
             let t = &shader.translated()?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
@@ -441,37 +441,22 @@ impl HostPipeline {
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
-                params.push(D3D12_ROOT_PARAMETER1 {
-                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                        Constants: D3D12_ROOT_CONSTANTS {
-                            ShaderRegister: 0,
-                            RegisterSpace: USER_DATA_SPACE,
-                            Num32BitValues: dwords,
-                        },
+                params.push(Parameter {
+                    kind: Kind::Constants {
+                        register: 0,
+                        space: USER_DATA_SPACE,
+                        count: dwords,
                     },
-                    ShaderVisibility: visibility,
+                    visibility,
                 });
             }
             for (slots, kind, out) in [
-                (
-                    &t.root_cbvs,
-                    D3D12_ROOT_PARAMETER_TYPE_CBV,
-                    &mut stage.root_cbvs,
-                ),
-                (
-                    &t.root_srvs,
-                    D3D12_ROOT_PARAMETER_TYPE_SRV,
-                    &mut stage.root_srvs,
-                ),
-                (
-                    &t.root_uavs,
-                    D3D12_ROOT_PARAMETER_TYPE_UAV,
-                    &mut stage.root_uavs,
-                ),
+                (&t.root_cbvs, rs::parameter::CBV, &mut stage.root_cbvs),
+                (&t.root_srvs, rs::parameter::SRV, &mut stage.root_srvs),
+                (&t.root_uavs, rs::parameter::UAV, &mut stage.root_uavs),
             ] {
                 for &slot in slots {
-                    let uav = kind == D3D12_ROOT_PARAMETER_TYPE_UAV;
+                    let uav = kind == rs::parameter::UAV;
                     // Ours, not the title's, stay root descriptors: the
                     // table of strides, the directory of title memory by
                     // address and its fault notes.
@@ -482,72 +467,55 @@ impl HostPipeline {
                             || slot == victory_shader::emit::SLOT_MEMORY
                             || slot == victory_shader::emit::SLOT_VIEW_ADDRESSES
                     };
-                    if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+                    out.push((slot, params.len() as u32));
+                    if (uav || kind == rs::parameter::SRV) && !ours && bounded_root_srvs() {
                         // A one-view table: the view's size bounds the
                         // reads (and a root UAV's writes), which a root
                         // descriptor leaves unbounded.
-                        // (Our own table of strides stays a descriptor.)
-                        ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
-                            RangeType: if uav {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_UAV
-                            } else {
-                                D3D12_DESCRIPTOR_RANGE_TYPE_SRV
-                            },
-                            NumDescriptors: 1,
-                            BaseShaderRegister: u32::from(slot),
-                            RegisterSpace: ROOT_CBV_SPACE,
-                            Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
-                                | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
-                            OffsetInDescriptorsFromTableStart: 0,
-                        }));
-                        let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
-                        out.push((slot, params.len() as u32));
-                        params.push(D3D12_ROOT_PARAMETER1 {
-                            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                            Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
-                                    NumDescriptorRanges: 1,
-                                    pDescriptorRanges: range,
-                                },
-                            },
-                            ShaderVisibility: visibility,
+                        params.push(Parameter {
+                            kind: Kind::Table(vec![Range {
+                                kind: if uav { rs::range::UAV } else { rs::range::SRV },
+                                count: 1,
+                                register: u32::from(slot),
+                                space: ROOT_CBV_SPACE,
+                                flags: (D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE)
+                                    .0 as u32,
+                                offset: 0,
+                            }]),
+                            visibility,
                         });
                         continue;
                     }
-                    out.push((slot, params.len() as u32));
-                    params.push(D3D12_ROOT_PARAMETER1 {
-                        ParameterType: kind,
-                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
-                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
-                                ShaderRegister: u32::from(slot),
-                                RegisterSpace: ROOT_CBV_SPACE,
-                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
-                            },
+                    params.push(Parameter {
+                        kind: Kind::Descriptor {
+                            kind,
+                            register: u32::from(slot),
+                            space: ROOT_CBV_SPACE,
+                            flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE.0 as u32,
                         },
-                        ShaderVisibility: visibility,
+                        visibility,
                     });
                 }
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
-                samplers.push(D3D12_STATIC_SAMPLER_DESC {
-                    Filter: D3D12_FILTER(s.filter as i32),
-                    AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.address[0] as i32),
-                    AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.address[1] as i32),
-                    AddressW: D3D12_TEXTURE_ADDRESS_MODE(s.address[2] as i32),
-                    MipLODBias: s.mip_lod_bias,
-                    MaxAnisotropy: s.max_anisotropy,
-                    ComparisonFunc: D3D12_COMPARISON_FUNC(s.comparison as i32),
-                    BorderColor: D3D12_STATIC_BORDER_COLOR(s.border as i32),
-                    MinLOD: s.min_lod,
-                    MaxLOD: s.max_lod,
-                    ShaderRegister: n as u32,
-                    RegisterSpace: SAMPLER_SPACE,
-                    ShaderVisibility: visibility,
+                samplers.push(rs::StaticSampler {
+                    filter: s.filter,
+                    address: s.address,
+                    mip_lod_bias: s.mip_lod_bias,
+                    max_anisotropy: s.max_anisotropy,
+                    comparison: s.comparison,
+                    border: s.border,
+                    min_lod: s.min_lod,
+                    max_lod: s.max_lod,
+                    register: n as u32,
+                    space: SAMPLER_SPACE,
+                    visibility,
                 });
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
+        let (root, root_blob) = match root_signature(&host.device, params, samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
@@ -972,10 +940,13 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
+/// The host root signature of `params` and `samplers`: serialized by
+/// `victory_host::root` (byte for byte what D3D12's serializer returns,
+/// the container checksum included), and made on the device.
 fn root_signature(
     device: &ID3D12Device,
-    params: &[D3D12_ROOT_PARAMETER1],
-    samplers: &[D3D12_STATIC_SAMPLER_DESC],
+    params: Vec<victory_host::root::Parameter>,
+    samplers: Vec<victory_host::root::StaticSampler>,
     compute: bool,
 ) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
     let input = if compute {
@@ -983,40 +954,19 @@ fn root_signature(
     } else {
         D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT
     };
-    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
-        Version: windows::Win32::Graphics::Direct3D12::D3D_ROOT_SIGNATURE_VERSION_1_1,
-        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
-            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
-                NumParameters: params.len() as u32,
-                pParameters: params.as_ptr(),
-                NumStaticSamplers: samplers.len() as u32,
-                pStaticSamplers: samplers.as_ptr(),
-                Flags: input
-                    | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
-                    | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED,
-            },
-        },
+    let desc = victory_host::root::RootSignature {
+        version: victory_host::root::Version::V1_1,
+        flags: (input
+            | D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED
+            | D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED)
+            .0 as u32,
+        parameters: params,
+        samplers,
     };
-    // SAFETY: the description points at live arrays; the blob is read in
-    // full before it is released.
-    unsafe {
-        let mut blob: Option<ID3DBlob> = None;
-        let mut error: Option<ID3DBlob> = None;
-        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
-            if let Some(error) = error {
-                let text = std::slice::from_raw_parts(
-                    error.GetBufferPointer().cast::<u8>(),
-                    error.GetBufferSize(),
-                );
-                tracing::warn!("root signature: {}", String::from_utf8_lossy(text));
-            }
-            return Err(e);
-        }
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        let bytes =
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
-        Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
-    }
+    let bytes = desc.serialize();
+    // SAFETY: a serialized root signature; D3D12 validates it.
+    let root = unsafe { device.CreateRootSignature(0, &bytes) }?;
+    Ok((root, bytes))
 }
 
 #[cfg(test)]
@@ -1125,7 +1075,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(&host.device, Vec::new(), Vec::new(), false).unwrap();
         let mut g = GraphicsState::default();
         // This pipeline has only a color target, with no depth buffer.
         g.depth.DepthEnable = false.into();
@@ -1181,7 +1131,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let vs = compile(&dxc, dir.path(), VS, "vs_6_5");
         let ps = compile(&dxc, dir.path(), PS, "ps_6_5");
-        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        let (root, root_blob) = root_signature(&host.device, Vec::new(), Vec::new(), false).unwrap();
 
         let mut g = GraphicsState::default();
         // Subobject 21 (`DEPTH_STENCIL1`) with `DepthBoundsTestEnable = true`,

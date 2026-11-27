@@ -15,6 +15,7 @@
 
 use core::fmt;
 
+pub mod dxbc;
 pub mod root;
 
 /// A resource's shape and use, laid out as D3D12.X's (and D3D12's)
