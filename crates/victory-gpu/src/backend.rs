@@ -5,7 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
-    Arguments, Binding, ComputeDesc, Draw, Geometry, GraphicsDesc, Pass, ShaderCode, Table, Vertices,
+    Arguments, Binding, ComputeDesc, Draw, Geometry, GraphicsDesc, Pass, ShaderCode, Vertices,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -280,20 +280,20 @@ impl D3d12List<'_> {
     unsafe fn root_arguments(
         &self,
         pipeline: &D3d12Pipeline,
-        constants: &[u32],
-        bindings: &[Binding<'_, ID3D12Resource>],
-        tables: &[Table<'_, ID3D12DescriptorHeap>],
+        arguments: &Arguments<'_, ID3D12Resource, ID3D12DescriptorHeap>,
         graphics: bool,
     ) {
         use victory_host::root::{Kind, parameter};
+        let Arguments { constants, bindings, tables, views, samplers } = *arguments;
         let l = self.0;
         // SAFETY: the caller's.
         unsafe {
-            // The tables' heaps (one view heap, one sampler heap at most).
+            // The tables' and the directly indexed heaps (one view heap,
+            // one sampler heap at most).
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::new();
-            for t in tables {
-                if !heaps.iter().flatten().any(|h| h == t.heap) {
-                    heaps.push(Some(t.heap.clone()));
+            for h in tables.iter().map(|t| t.heap).chain(views).chain(samplers) {
+                if !heaps.iter().flatten().any(|x| x == h) {
+                    heaps.push(Some(h.clone()));
                 }
             }
             if !heaps.is_empty() {
@@ -410,16 +410,14 @@ impl Recorder for D3d12List<'_> {
     unsafe fn dispatch(
         &self,
         pipeline: &D3d12Pipeline,
-        constants: &[u32],
-        bindings: &[Binding<'_, ID3D12Resource>],
-        tables: &[Table<'_, ID3D12DescriptorHeap>],
+        arguments: &Arguments<'_, ID3D12Resource, ID3D12DescriptorHeap>,
         groups: [u32; 3],
     ) {
         // SAFETY: the caller's open list, live resources and ranges.
         unsafe {
             self.0.SetComputeRootSignature(&pipeline.root);
             self.0.SetPipelineState(&pipeline.state);
-            self.root_arguments(pipeline, constants, bindings, tables, false);
+            self.root_arguments(pipeline, arguments, false);
             self.0.Dispatch(groups[0], groups[1], groups[2]);
         }
     }
@@ -440,7 +438,7 @@ impl Recorder for D3d12List<'_> {
         unsafe {
             l.SetGraphicsRootSignature(&pipeline.root);
             l.SetPipelineState(&pipeline.state);
-            self.root_arguments(pipeline, arguments.constants, arguments.bindings, arguments.tables, true);
+            self.root_arguments(pipeline, arguments, true);
             self.pass(pass);
             l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(vertices.primitive as i32));
             let size = |r: &ID3D12Resource, offset: u64| r.GetDesc().Width.saturating_sub(offset) as u32;
@@ -484,7 +482,7 @@ impl Recorder for D3d12List<'_> {
             let Ok(l6) = self.0.cast::<ID3D12GraphicsCommandList6>() else { return };
             self.0.SetGraphicsRootSignature(&pipeline.root);
             self.0.SetPipelineState(&pipeline.state);
-            self.root_arguments(pipeline, arguments.constants, arguments.bindings, arguments.tables, true);
+            self.root_arguments(pipeline, arguments, true);
             self.pass(pass);
             l6.DispatchMesh(groups[0], groups[1], groups[2]);
         }

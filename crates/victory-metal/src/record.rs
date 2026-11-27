@@ -18,9 +18,7 @@ use objc2_metal::{
     MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
     MTLTriangleFillMode, MTLViewport, MTLWinding,
 };
-use victory_host::{
-    Arguments, Barrier, Binding, Draw, Location, Pass, Recorder, Region, Table, Vertices,
-};
+use victory_host::{Arguments, Barrier, Binding, Draw, Location, Pass, Recorder, Region, Vertices};
 
 use crate::device::{Abi, MetalDescriptorHeap, MetalPipeline, MetalResource, StaticSamplers};
 use crate::render::{Kind, MetalGraphicsPipeline};
@@ -30,6 +28,11 @@ use crate::{DESCRIPTOR_BYTES, MetalError};
 use crate::format::console_block;
 
 type Encoder = Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>;
+
+/// MSC's buffer indices for directly indexed heaps
+/// (`kIRDescriptorHeapBindPoint`, `kIRSamplerHeapBindPoint`).
+const VIEW_HEAP_INDEX: usize = 0;
+const SAMPLER_HEAP_INDEX: usize = 1;
 type RenderEncoder = Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>;
 
 /// What one dispatch or draw makes resident.
@@ -69,10 +72,16 @@ impl MetalRecorder {
     fn residency(
         &self,
         top: &TopLevel,
-        bindings: &[Binding<'_, MetalResource>],
-        tables: &[Table<'_, MetalDescriptorHeap>],
+        arguments: &Arguments<'_, MetalResource, MetalDescriptorHeap>,
         statics: Option<&StaticSamplers>,
     ) -> Residency {
+        let Arguments {
+            bindings,
+            tables,
+            views,
+            samplers,
+            ..
+        } = *arguments;
         let mut out = Residency::default();
         let mut add = |resource: Retained<ProtocolObject<dyn MTLResource>>, writes: bool| {
             if let Some(h) = resource.heap() {
@@ -113,6 +122,15 @@ impl MetalRecorder {
                     &mut named,
                 );
             }
+        }
+        // A directly indexed heap: any slot may be read, so all of them.
+        for h in views.into_iter().chain(samplers) {
+            add(ProtocolObject::from_retained(h.table.clone()), false);
+            let base = h.table.contents().as_ptr() as usize;
+            self.slots.resident(
+                base..base + h.count as usize * DESCRIPTOR_BYTES as usize,
+                &mut named,
+            );
         }
         for (r, writes) in named {
             let resource: Retained<ProtocolObject<dyn MTLResource>> = match r {
@@ -294,7 +312,31 @@ impl MetalRecorder {
                 enc.setFragmentBytes_length_atIndex(bytes, top.len(), index);
             }
         }
-        let residency = self.residency(&pipeline.top, args.bindings, args.tables, statics);
+        // Directly indexed heaps at MSC's descriptor heap bind points, on
+        // each stage.
+        for (heap, index) in [
+            (args.views, VIEW_HEAP_INDEX),
+            (args.samplers, SAMPLER_HEAP_INDEX),
+        ] {
+            let Some(h) = heap else { continue };
+            let table = Some(&*h.table);
+            // SAFETY: a live heap's table.
+            unsafe {
+                if stages.contains(MTLRenderStages::Vertex) {
+                    enc.setVertexBuffer_offset_atIndex(table, 0, index);
+                }
+                if stages.contains(MTLRenderStages::Object) {
+                    enc.setObjectBuffer_offset_atIndex(table, 0, index);
+                }
+                if stages.contains(MTLRenderStages::Mesh) {
+                    enc.setMeshBuffer_offset_atIndex(table, 0, index);
+                }
+                if stages.contains(MTLRenderStages::Fragment) {
+                    enc.setFragmentBuffer_offset_atIndex(table, 0, index);
+                }
+            }
+        }
+        let residency = self.residency(&pipeline.top, args, statics);
         for h in &residency.heaps {
             enc.useHeap_stages(h, stages);
         }
@@ -400,11 +442,16 @@ impl Recorder for MetalRecorder {
     unsafe fn dispatch(
         &self,
         pipeline: &MetalPipeline,
-        constants: &[u32],
-        bindings: &[Binding<'_, MetalResource>],
-        tables: &[Table<'_, MetalDescriptorHeap>],
+        arguments: &Arguments<'_, MetalResource, MetalDescriptorHeap>,
         groups: [u32; 3],
     ) {
+        let Arguments {
+            constants,
+            bindings,
+            tables,
+            views,
+            samplers,
+        } = *arguments;
         self.end();
         let Some(enc) = self.buffer.computeCommandEncoder() else {
             return;
@@ -439,7 +486,14 @@ impl Recorder for MetalRecorder {
                     crate::irconverter::ARGUMENT_BUFFER_INDEX,
                 );
             }
-            let residency = self.residency(&pipeline.top, bindings, tables, statics);
+            // Directly indexed heaps at MSC's descriptor heap bind points.
+            for (heap, index) in [(views, VIEW_HEAP_INDEX), (samplers, SAMPLER_HEAP_INDEX)] {
+                if let Some(h) = heap {
+                    // SAFETY: a live heap's table.
+                    unsafe { enc.setBuffer_offset_atIndex(Some(&h.table), 0, index) };
+                }
+            }
+            let residency = self.residency(&pipeline.top, arguments, statics);
             for h in &residency.heaps {
                 enc.useHeap(h);
             }

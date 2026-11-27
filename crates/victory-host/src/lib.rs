@@ -478,12 +478,37 @@ pub struct GraphicsDesc<'a> {
     pub depth: DepthTest,
 }
 
-/// The arguments the root signature takes, for a draw.
+/// A dispatch's or draw's arguments: what the root signature takes
+/// (constants, root descriptors' bindings, tables: [`ComputeDesc`] says
+/// where each goes), and the heaps shaders index directly
+/// (`ResourceDescriptorHeap[]` / `SamplerDescriptorHeap[]`, root
+/// signatures flagged `*_HEAP_DIRECTLY_INDEXED`).
 #[derive(Debug)]
 pub struct Arguments<'a, R, H> {
     pub constants: &'a [u32],
     pub bindings: &'a [Binding<'a, R>],
     pub tables: &'a [Table<'a, H>],
+    /// The shader-visible view heap shaders index directly.
+    pub views: Option<&'a H>,
+    /// The shader-visible sampler heap shaders index directly.
+    pub samplers: Option<&'a H>,
+}
+
+impl<'a, R, H> Arguments<'a, R, H> {
+    /// Root signature arguments only, no directly indexed heaps.
+    pub fn root(
+        constants: &'a [u32],
+        bindings: &'a [Binding<'a, R>],
+        tables: &'a [Table<'a, H>],
+    ) -> Self {
+        Arguments {
+            constants,
+            bindings,
+            tables,
+            views: None,
+            samplers: None,
+        }
+    }
 }
 
 impl<R, H> Clone for Arguments<'_, R, H> {
@@ -635,19 +660,17 @@ pub trait Recorder {
     type GraphicsPipeline;
     type DescriptorHeap;
 
-    /// Runs `pipeline` over `groups` thread groups with `constants`,
-    /// `bindings` and `tables` (see [`ComputeDesc`]).
+    /// Runs `pipeline` over `groups` thread groups with `arguments`.
     ///
     /// # Safety
     /// See the trait; the bindings stay inside their buffers, the tables
-    /// inside their heaps, and every descriptor the shader reads through a
-    /// table names a live resource (or is null).
+    /// inside their heaps, and every descriptor the shader reads (through
+    /// a table or a directly indexed heap) names a live resource or is
+    /// null.
     unsafe fn dispatch(
         &self,
         pipeline: &Self::Pipeline,
-        constants: &[u32],
-        bindings: &[Binding<'_, Self::Resource>],
-        tables: &[Table<'_, Self::DescriptorHeap>],
+        arguments: &Arguments<'_, Self::Resource, Self::DescriptorHeap>,
         groups: [u32; 3],
     );
 

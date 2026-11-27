@@ -1010,9 +1010,7 @@ mod tests {
         unsafe {
             rec.dispatch(
                 &pipeline,
-                &[1000],
-                &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
-                &[],
+                &victory_host::Arguments::root(&[1000], &[Binding::Read(&input, 0), Binding::Write(&out, 0)], &[]),
                 [4, 1, 1],
             )
         };
@@ -1079,9 +1077,7 @@ mod tests {
         unsafe {
             rec.dispatch(
                 &pipeline,
-                &[1000],
-                &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
-                &[],
+                &victory_host::Arguments::root(&[1000], &[Binding::Read(&input, 0), Binding::Write(&out, 0)], &[]),
                 [4, 1, 1],
             )
         };
@@ -1151,9 +1147,7 @@ mod tests {
         unsafe {
             rec.dispatch(
                 &pipeline,
-                &[3, 1000],
-                &[Binding::Write(&out, 0), Binding::Read(&input, 0)],
-                &[],
+                &victory_host::Arguments::root(&[3, 1000], &[Binding::Write(&out, 0), Binding::Read(&input, 0)], &[]),
                 [8, 1, 1],
             )
         };
@@ -1258,12 +1252,10 @@ mod tests {
         unsafe {
             rec.dispatch(
                 &pipeline,
-                &[1000],
-                &[],
-                &[Table {
+                &victory_host::Arguments::root(&[1000], &[], &[Table {
                     heap: &views,
                     first: 5,
-                }],
+                }]),
                 [count / 64, 1, 1],
             )
         };
@@ -1446,6 +1438,8 @@ mod tests {
                     constants: &red,
                     bindings: &[],
                     tables: &[],
+                    views: None,
+                    samplers: None,
                 },
                 &Vertices {
                     buffers: &[VertexBuffer {
@@ -1471,6 +1465,8 @@ mod tests {
                     constants: &green,
                     bindings: &[],
                     tables: &[],
+                    views: None,
+                    samplers: None,
                 },
                 &Vertices {
                     buffers: &[VertexBuffer {
@@ -1554,6 +1550,8 @@ mod tests {
                     constants: &red,
                     bindings: &[],
                     tables: &[],
+                    views: None,
+                    samplers: None,
                 },
                 [1, 1, 1],
             )
@@ -1665,12 +1663,116 @@ mod tests {
             );
             rec.dispatch(
                 &pipeline,
-                &[],
-                &[],
-                &[Table {
+                &victory_host::Arguments::root(&[], &[], &[Table {
                     heap: &views,
                     first: 0,
-                }],
+                }]),
+                [1, 1, 1],
+            );
+        }
+        rec.commit_and_wait().expect("the dispatch runs");
+        let MetalResource::Buffer(o) = &out else {
+            unreachable!()
+        };
+        let got = o.contents().as_ptr().cast::<[f32; 4]>();
+        for i in 0..8 {
+            let want = texels[i.min(3)].map(|c| f32::from(c) / 255.0);
+            assert_eq!(unsafe { got.add(i).read() }, want, "thread {i}");
+        }
+    }
+
+    /// Directly indexed heaps on the GPU (`ResourceDescriptorHeap[]`,
+    /// `SamplerDescriptorHeap[]`, shader model 6.6, as the translated
+    /// title shaders use them): texture at view slot 5, output at 9,
+    /// sampler at sampler slot 2, the slots given in root constants.
+    /// Needs Metal Shader Converter and heap.dxil.
+    #[test]
+    fn directly_indexed_heaps_on_the_gpu() {
+        use victory_host::{
+            Arguments, ComputeDesc, Location, Recorder as _, SamplerDesc, ShaderCode,
+            UnorderedViewDesc,
+        };
+        let Some(dxil) = fixture("heap.dxil") else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &[],
+                threads: [0; 3],
+            })
+            .expect("Metal Shader Converter converts the shader");
+        let desc = texture(4, 1, 28, 0);
+        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
+        let mut fp = [victory_host::Footprint::default()];
+        let bytes = gpu.copy_layout(&desc, 0, &mut fp);
+        let texels: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        let mut words = vec![0u32; bytes.div_ceil(4) as usize];
+        for (i, t) in texels.iter().enumerate() {
+            words[fp[0].offset as usize / 4 + i] = u32::from_le_bytes(*t);
+        }
+        let up = upload(&gpu, &words);
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(8 * 16, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let views = gpu.descriptor_heap(Descriptors::Views, 16, true).unwrap();
+        let samplers = gpu.descriptor_heap(Descriptors::Samplers, 4, true).unwrap();
+        let view = |n: usize| gpu.descriptor_start(&views) + n * DESCRIPTOR_BYTES as usize;
+        let sampler = |n: usize| gpu.descriptor_start(&samplers) + n * DESCRIPTOR_BYTES as usize;
+        unsafe {
+            gpu.shader_view(Some(&tex), None, view(5));
+            gpu.unordered_view(
+                Some(&out),
+                Some(&UnorderedViewDesc {
+                    format: 0,
+                    dimension: view::BUFFER,
+                    fields: [0, 8 | (16 << 32), 0, 0],
+                }),
+                view(9),
+            );
+            gpu.sampler(
+                &SamplerDesc {
+                    filter: 0,           // point
+                    address: [3, 3, 3], // clamp
+                    mip_lod_bias: 0.0,
+                    max_anisotropy: 1,
+                    comparison: 8,
+                    border: [0.0; 4],
+                    min_lod: 0.0,
+                    max_lod: f32::MAX,
+                },
+                sampler(2),
+            );
+        }
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.copy_texture(
+                Location::Subresource(&tex, 0),
+                [0, 0, 0],
+                Location::Footprint(&up, fp[0]),
+                None,
+            );
+            rec.dispatch(
+                &pipeline,
+                &Arguments {
+                    constants: &[5, 9, 2],
+                    bindings: &[],
+                    tables: &[],
+                    views: Some(&views),
+                    samplers: Some(&samplers),
+                },
                 [1, 1, 1],
             );
         }
