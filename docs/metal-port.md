@@ -27,6 +27,8 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 
 9. slice 3b step 1, root signatures: `victory_host::root` parses serialized D3D12 root signatures (1.0 / 1.1, DXBC container or bare `RTS0`; byte-exact `serialize` too), unit-tested on Linux against dxc-built blobs (`root::samples`, from `victory-host/tests/fixtures/root_signatures.hlsl`). `ComputeDesc` contract now: walk the root signature's parameters in order, root constants take the next N constants, root CBV/SRV/UAV the next binding (tables: step 2); empty `root_signature` = the DXIL's embedded one. D3D12 (`D3d12List::dispatch`) follows it too. Metal: `irconverter::root_signature` builds `IRVersionedRootSignatureDescriptor` (version kept), set as the compiler's global root signature (embedded one ignored); `toplevel::TopLevel` lays out the top-level argument buffer per parameter (constants 4-aligned inline, root descriptors and tables 8-byte addresses). Mac tests: `separate_root_signature_runs_on_the_gpu` (`swap.dxil`, root signature stripped, handed in: UAV, constants(2), SRV), `irconverter_layout_matches` (our offsets vs MSC's `resource_locations()` for RS10 / RS11 / swap). **Not yet run on the Mac.**
 
+10. slice 3b step 2, descriptor tables: seam `Table { heap, first }`, `Recorder::dispatch(.., tables, ..)` (`Recorder::DescriptorHeap`). D3D12: `SetDescriptorHeaps` with the tables' heaps, `SetComputeRootDescriptorTable(heap GPU start + first * step)`. Metal: the table's top-level entry is `heap buffer GPU address + first * 24` (our `IRDescriptorTableEntry` heaps as is). Residency: root descriptors' buffers, each table's descriptor buffer (`useResource`, read), then every slot the root signature's ranges reach from `first` (`TopLevel::reached`, unbounded = to the heap's end, clipped): placed resources by `useHeap` once per heap, the rest by `useResource` (read-write when an unordered view names it; texture views go by their parent). Slots now keep the buffers buffer views name (BTreeMap by slot address, so a table's slots are a range query); constant views find their buffer by GPU address among buffers the device made (weak refs). Mac test `descriptor_table_runs_on_the_gpu` (`table.dxil`: SRV + UAV + CBV in one table at slot 5, input placed in a heap). **Not yet run on the Mac.**
+
 ## Still direct D3D12 in victory-gpu
 
 - barriers + copies: all production ones go through `Recorder` now (`record_barriers`, `rec(list).copy_*`, with `barrier_of` / `location_of` converting D3D12-built structs). Left direct: diagnostics (`capture.rs`), probes + test helpers (`memory/*`), GPU tests. Next cleanup: build `Barrier`/`Location` at the call sites instead of converting.
@@ -39,7 +41,7 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 ## Next slices
 
 2. ~~2a barriers/copies~~ done. **Order from here: slice 3 before 2b** — Metal can't record a draw or dispatch without a pipeline, so pipelines + root signatures come first.
-3. ~~3a compute pipelines + dispatch~~ done. 3b: ~~converter wired~~, ~~separately-supplied root signatures -> MSC descriptors + top-level layout~~ (step 1); step 2 descriptor tables in the top-level argument buffer (24-byte `IRDescriptorTableEntry` heaps) + `useResource`/`useHeap` residency; step 3 graphics pipelines (VS+PS, then mesh) through the seam. Then moving victory-gpu's 11 compute PSOs / 14 root signatures onto the seam. Tile mapping for sparse.
+3. ~~3a compute pipelines + dispatch~~ done. 3b: ~~converter wired~~, ~~separately-supplied root signatures -> MSC descriptors + top-level layout~~ (step 1); ~~step 2 descriptor tables + `useResource`/`useHeap` residency~~; step 3 graphics pipelines (VS+PS, then mesh) through the seam. Then moving victory-gpu's 11 compute PSOs / 14 root signatures onto the seam. Tile mapping for sparse.
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
 5. present (CAMetalLayer via winemac.drv's view) + MetalFX instead of FSR
 
@@ -72,6 +74,8 @@ Type-checks only. Runtime still needs: Windows + a game for the D3D12 side, a Ma
 ## Gotchas
 
 - `crates/victory-formats/src/bcpack-tables.bin` comes from `Initialize-FormatTables.ps1` (or curl the pinned Marvisak URL in that script, check the SHA-256); bcpack tests fail without it.
+- Residency walks every reached slot per dispatch (a range query, but unbounded bindless tables over a big heap = many `useResource` calls). macOS 15 `MTLResidencySet` on the queue is the likely end state (needs macOS 15 anyway, Rosetta AVX2); `useHeap` already covers placed resources cheaply.
+- A buffer stays alive while a descriptor slot names it (slots keep it, for residency): rewriting/clearing slots frees it.
 - MSC is told to ignore the embedded root signature when one is handed in (D3D12: the PSO's wins). Untested with both present and different.
 - Metal table entry metadata words follow MSC's runtime header from memory — check vs `metal_irconverter_runtime.h` when shaders run. Typed buffer SRV/UAVs need texture-buffer views (TODO), stencil-plane views too.
 - Packed 16-bit formats (B5G6R5, BGR5A1, B4G4R4A4) channel order vs Metal unverified — needs a draw-and-read test.

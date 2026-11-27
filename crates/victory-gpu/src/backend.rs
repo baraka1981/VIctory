@@ -5,7 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
-    Binding, ComputeDesc, ShaderCode,
+    Binding, ComputeDesc, ShaderCode, Table,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -272,12 +272,14 @@ pub(crate) struct D3d12List<'a>(pub(crate) &'a ID3D12GraphicsCommandList);
 impl Recorder for D3d12List<'_> {
     type Resource = ID3D12Resource;
     type Pipeline = D3d12Pipeline;
+    type DescriptorHeap = ID3D12DescriptorHeap;
 
     unsafe fn dispatch(
         &self,
         pipeline: &D3d12Pipeline,
         constants: &[u32],
         bindings: &[Binding<'_, ID3D12Resource>],
+        tables: &[Table<'_, ID3D12DescriptorHeap>],
         groups: [u32; 3],
     ) {
         use victory_host::root::{Kind, parameter};
@@ -287,7 +289,17 @@ impl Recorder for D3d12List<'_> {
         unsafe {
             self.0.SetComputeRootSignature(&pipeline.root);
             self.0.SetPipelineState(&pipeline.state);
-            let (mut constants, mut bindings) = (constants, bindings.iter());
+            // The tables' heaps (one view heap, one sampler heap at most).
+            let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::new();
+            for t in tables {
+                if !heaps.iter().flatten().any(|h| h == t.heap) {
+                    heaps.push(Some(t.heap.clone()));
+                }
+            }
+            if !heaps.is_empty() {
+                self.0.SetDescriptorHeaps(&heaps);
+            }
+            let (mut constants, mut bindings, mut tables) = (constants, bindings.iter(), tables.iter());
             for (i, p) in pipeline.parameters.iter().enumerate() {
                 let i = i as u32;
                 match *p {
@@ -309,7 +321,18 @@ impl Recorder for D3d12List<'_> {
                             _ => self.0.SetComputeRootUnorderedAccessView(i, address),
                         }
                     }
-                    Kind::Table(_) => {}
+                    Kind::Table(_) => {
+                        let Some(t) = tables.next() else { continue };
+                        let mut device: Option<ID3D12Device> = None;
+                        if t.heap.GetDevice(&mut device).is_err() {
+                            continue;
+                        }
+                        let Some(device) = device else { continue };
+                        let step = device.GetDescriptorHandleIncrementSize(t.heap.GetDesc().Type);
+                        let mut handle = t.heap.GetGPUDescriptorHandleForHeapStart();
+                        handle.ptr += u64::from(t.first) * u64::from(step);
+                        self.0.SetComputeRootDescriptorTable(i, handle);
+                    }
                 }
             }
             self.0.Dispatch(groups[0], groups[1], groups[2]);

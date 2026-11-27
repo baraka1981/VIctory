@@ -13,9 +13,13 @@
 //! texture-buffer view rather than a raw address).
 //!
 //! Metal objects a slot needs (texture views, sampler states, target
-//! views) are kept alive per slot address until the slot is rewritten.
+//! views) are kept alive per slot address until the slot is rewritten,
+//! and so are the buffers buffer views name: a dispatch makes what a
+//! table's slots name resident (`Slots::resident`), so it has to know them.
+//! (A buffer thus lives until the last slot naming it is rewritten.)
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::ops::Range;
 use std::sync::Mutex;
 
 use objc2::rc::Retained;
@@ -32,6 +36,7 @@ use victory_host::{
 
 use crate::format;
 
+type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Texture = Retained<ProtocolObject<dyn MTLTexture>>;
 type Sampler = Retained<ProtocolObject<dyn MTLSamplerState>>;
 
@@ -43,31 +48,62 @@ pub struct Target {
     pub slice: usize,
 }
 
-/// Held only to keep the Metal object alive while a slot names it.
+/// What a slot names: kept alive while it does.
 #[derive(Clone)]
 pub(crate) enum Kept {
-    Texture(#[allow(dead_code)] Texture),
+    Buffer(Buffer),
+    Texture(Texture),
     Sampler(#[allow(dead_code)] Sampler),
     Target(Target),
 }
 
+#[derive(Clone)]
+struct Slot {
+    kept: Kept,
+    /// An unordered access view: the shader may write it.
+    write: bool,
+}
+
+/// A resource a dispatch makes resident.
+pub(crate) enum Resident {
+    Buffer(Buffer),
+    Texture(Texture),
+}
+
 /// Objects slots refer to, by slot address.
 #[derive(Default)]
-pub(crate) struct Slots(Mutex<HashMap<usize, Kept>>);
+pub(crate) struct Slots(Mutex<BTreeMap<usize, Slot>>);
 
 impl Slots {
-    pub(crate) fn set(&self, at: usize, kept: Option<Kept>) {
+    pub(crate) fn set(&self, at: usize, kept: Option<Kept>, write: bool) {
         let mut slots = self.0.lock().unwrap_or_else(|e| e.into_inner());
         match kept {
-            Some(k) => slots.insert(at, k),
+            Some(kept) => slots.insert(at, Slot { kept, write }),
             None => slots.remove(&at),
         };
     }
 
     pub(crate) fn target(&self, at: usize) -> Option<Target> {
         match self.0.lock().unwrap_or_else(|e| e.into_inner()).get(&at) {
-            Some(Kept::Target(t)) => Some(t.clone()),
+            Some(Slot {
+                kept: Kept::Target(t),
+                ..
+            }) => Some(t.clone()),
             _ => None,
+        }
+    }
+
+    /// The buffers and textures (with whether they may be written) named
+    /// by slots at addresses in `range`.
+    pub(crate) fn resident(&self, range: Range<usize>, out: &mut Vec<(Resident, bool)>) {
+        let slots = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        for slot in slots.range(range).map(|(_, s)| s) {
+            let r = match &slot.kept {
+                Kept::Buffer(b) => Resident::Buffer(b.clone()),
+                Kept::Texture(t) => Resident::Texture(t.clone()),
+                Kept::Sampler(_) | Kept::Target(_) => continue,
+            };
+            out.push((r, slot.write));
         }
     }
 

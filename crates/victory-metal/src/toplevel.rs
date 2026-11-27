@@ -5,10 +5,16 @@
 //! descriptor table the 64-bit GPU address of its first entry (8-byte
 //! aligned). Static samplers take no room.
 //!
+//! A table's entry points at descriptor `first` of a heap; its ranges say
+//! which descriptors from there the shader may read ([`TopLevel::reached`]),
+//! which is what has to be made resident.
+//!
 //! Portable (unit-tested anywhere); `irconverter_layout_matches` on the
 //! Mac checks it against what MSC reports for the same root signature.
 
-use victory_host::root::{Kind, RootSignature};
+use std::ops::Range;
+
+use victory_host::root::{self, Kind, RootError, RootSignature};
 
 /// What one root parameter puts in the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,35 +35,88 @@ pub struct Entry {
     pub offset: u32,
 }
 
+/// Descriptors one range of a table covers, from the table's start
+/// (`count` [`root::UNBOUNDED`]: to the heap's end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: u32,
+    pub count: u32,
+}
+
 /// The layout for one root signature.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TopLevel {
     /// One per root parameter, in order.
     pub entries: Vec<Entry>,
+    /// Each table's ranges, in table order.
+    pub tables: Vec<Vec<Span>>,
     pub bytes: u32,
 }
 
 impl TopLevel {
-    pub fn new(rs: &RootSignature) -> TopLevel {
+    pub fn new(rs: &RootSignature) -> Result<TopLevel, RootError> {
         let mut at = 0u32;
-        let entries = rs
-            .parameters
-            .iter()
-            .map(|p| {
-                let (slot, size, align) = match p.kind {
-                    Kind::Constants { count, .. } => (Slot::Constants(count), 4 * count, 4),
-                    Kind::Descriptor { kind, .. } => (Slot::Descriptor(kind), 8, 8),
-                    Kind::Table(_) => (Slot::Table, 8, 8),
-                };
-                let offset = at.next_multiple_of(align);
-                at = offset + size;
-                Entry { slot, offset }
-            })
-            .collect();
-        TopLevel {
-            entries,
-            bytes: at.next_multiple_of(8),
+        let mut tables = Vec::new();
+        let mut entries = Vec::with_capacity(rs.parameters.len());
+        for p in &rs.parameters {
+            let (slot, size, align) = match &p.kind {
+                &Kind::Constants { count, .. } => (Slot::Constants(count), 4 * count, 4),
+                &Kind::Descriptor { kind, .. } => (Slot::Descriptor(kind), 8, 8),
+                Kind::Table(ranges) => {
+                    let starts = root::table_starts(ranges)?;
+                    tables.push(
+                        ranges
+                            .iter()
+                            .zip(starts)
+                            .map(|(r, start)| Span {
+                                start,
+                                count: r.count,
+                            })
+                            .collect(),
+                    );
+                    (Slot::Table, 8, 8)
+                }
+            };
+            let offset = at.next_multiple_of(align);
+            at = offset + size;
+            entries.push(Entry { slot, offset });
         }
+        Ok(TopLevel {
+            entries,
+            tables,
+            bytes: at.next_multiple_of(8),
+        })
+    }
+
+    /// Descriptor indices of a heap of `heap_count` that table `table`,
+    /// pointed at index `first`, can reach: its ranges, merged, sorted,
+    /// clipped to the heap.
+    pub fn reached(&self, table: usize, first: u32, heap_count: u32) -> Vec<Range<u32>> {
+        let Some(spans) = self.tables.get(table) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Range<u32>> = spans
+            .iter()
+            .map(|s| {
+                let start = first.saturating_add(s.start).min(heap_count);
+                let end = if s.count == root::UNBOUNDED {
+                    heap_count
+                } else {
+                    start.saturating_add(s.count).min(heap_count)
+                };
+                start..end
+            })
+            .filter(|r| !r.is_empty())
+            .collect();
+        out.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<u32>> = Vec::with_capacity(out.len());
+        for r in out {
+            match merged.last_mut() {
+                Some(m) if r.start <= m.end => m.end = m.end.max(r.end),
+                _ => merged.push(r),
+            }
+        }
+        merged
     }
 
     /// The buffer for one dispatch: constants fill the constants entries
@@ -177,7 +236,7 @@ mod tests {
             ],
             samplers: vec![],
         };
-        let top = TopLevel::new(&rs);
+        let top = TopLevel::new(&rs).unwrap();
         let offsets: Vec<u32> = top.entries.iter().map(|e| e.offset).collect();
         assert_eq!(offsets, [0, 8, 16]);
         assert_eq!(top.bytes, 24);
@@ -191,7 +250,7 @@ mod tests {
     #[test]
     fn every_parameter_kind_in_order() {
         // RS10: constants(3), CBV, SRV, UAV, table, sampler table.
-        let top = TopLevel::new(&root::parse(&samples::RS10).unwrap());
+        let top = TopLevel::new(&root::parse(&samples::RS10).unwrap()).unwrap();
         assert_eq!(
             top.entries,
             [
@@ -231,10 +290,39 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn tables_reach_their_ranges() {
+        // RS10's first table: SRV x4 (append), CBV at 4, UAV unbounded at
+        // 8; its second: two samplers.
+        let top = TopLevel::new(&root::parse(&samples::RS10).unwrap()).unwrap();
+        assert_eq!(
+            top.tables[0],
+            [
+                Span { start: 0, count: 4 },
+                Span { start: 4, count: 1 },
+                Span {
+                    start: 8,
+                    count: root::UNBOUNDED
+                },
+            ]
+        );
+        // From index 10 of 32: 10..15 then 18.. to the end.
+        assert_eq!(top.reached(0, 10, 32), [10..15, 18..32]);
+        // Clipped by a small heap; nothing past its end.
+        assert_eq!(top.reached(0, 10, 12), [10..12]);
+        assert_eq!(top.reached(0, 40, 32), []);
+        assert_eq!(top.reached(1, 3, 16), [3..5]);
+        assert_eq!(top.reached(2, 0, 16), [], "no third table");
+        // RS11's table: SRV x2, UAV appended after: one run.
+        let top = TopLevel::new(&root::parse(&samples::RS11).unwrap()).unwrap();
+        assert_eq!(top.reached(0, 5, 16), [5..8]);
+    }
+
+    #[test]
     fn addresses_before_constants() {
         // UAV, constants(2), SRV: the order the swap.hlsl test uses.
         let rs = root::parse(&swap_root_signature().serialize()).unwrap();
-        let top = TopLevel::new(&rs);
+        let top = TopLevel::new(&rs).unwrap();
         let offsets: Vec<u32> = top.entries.iter().map(|e| e.offset).collect();
         assert_eq!(offsets, [0, 8, 16]);
         let ab = top.fill(&[3, 1000], &[0x1000, 0x2000], &[]);

@@ -320,7 +320,7 @@ pub enum ShaderCode<'a> {
 /// Its root signature says where a dispatch's arguments go: walking its
 /// parameters in order, each root constants parameter takes the next
 /// `count` of the dispatch's constants, and each root CBV / SRV / UAV the
-/// next binding. (Descriptor tables: slice 3b, step 2.)
+/// next binding, and each descriptor table the next [`Table`].
 ///
 /// D3D12 and converted DXIL on Metal: `root_signature` is serialized
 /// ([`root`]: a container or a bare `RTS0` part); empty means the one
@@ -344,6 +344,22 @@ pub enum Binding<'a, R> {
     /// Read-write (root UAV) from `offset`.
     Write(&'a R, u64),
 }
+
+/// A descriptor table for a dispatch: descriptors of `heap` (a
+/// shader-visible view or sampler heap) from index `first`. The root
+/// signature's ranges say which of them the shader reads.
+#[derive(Debug)]
+pub struct Table<'a, H> {
+    pub heap: &'a H,
+    pub first: u32,
+}
+
+impl<H> Clone for Table<'_, H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<H> Copy for Table<'_, H> {}
 
 impl<R> Clone for Binding<'_, R> {
     fn clone(&self) -> Self {
@@ -372,17 +388,21 @@ impl<R> Copy for Barrier<'_, R> {}
 pub trait Recorder {
     type Resource;
     type Pipeline;
+    type DescriptorHeap;
 
-    /// Runs `pipeline` over `groups` thread groups with `constants` and
-    /// `bindings` (see [`ComputeDesc`]).
+    /// Runs `pipeline` over `groups` thread groups with `constants`,
+    /// `bindings` and `tables` (see [`ComputeDesc`]).
     ///
     /// # Safety
-    /// See the trait; the bindings stay inside their buffers.
+    /// See the trait; the bindings stay inside their buffers, the tables
+    /// inside their heaps, and every descriptor the shader reads through a
+    /// table names a live resource (or is null).
     unsafe fn dispatch(
         &self,
         pipeline: &Self::Pipeline,
         constants: &[u32],
         bindings: &[Binding<'_, Self::Resource>],
+        tables: &[Table<'_, Self::DescriptorHeap>],
         groups: [u32; 3],
     );
 

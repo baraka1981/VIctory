@@ -4,7 +4,10 @@
 //! and are ignored; clear values belong to Metal render passes and are
 //! ignored here too.
 
-use objc2::rc::Retained;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::{
@@ -66,7 +69,10 @@ pub struct MetalPipeline {
 pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Metal objects descriptor slots refer to, by slot address.
-    slots: Slots,
+    slots: Arc<Slots>,
+    /// Buffers made here, by GPU address, for constant views (which name
+    /// an address, not a buffer).
+    buffers: Mutex<BTreeMap<u64, (u64, Weak<ProtocolObject<dyn MTLBuffer>>)>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
@@ -79,7 +85,8 @@ impl MetalDevice {
             .ok_or(MetalError::Failed("a command queue"))?;
         Ok(MetalDevice {
             device,
-            slots: Slots::default(),
+            slots: Arc::default(),
+            buffers: Mutex::default(),
             queue,
         })
     }
@@ -90,7 +97,7 @@ impl MetalDevice {
             .queue
             .commandBuffer()
             .ok_or(MetalError::Failed("a command buffer"))?;
-        Ok(MetalRecorder::new(buffer))
+        Ok(MetalRecorder::new(buffer, self.slots.clone()))
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -103,14 +110,38 @@ impl MetalDevice {
         self.slots.target(at)
     }
 
-    /// Writes an entry and what keeps it valid.
+    /// Writes an entry and what it names (`write`: an unordered access
+    /// view).
     ///
     /// # Safety
     /// `at` is an entry of a live descriptor table.
-    unsafe fn put(&self, at: usize, words: [u64; 3], kept: Option<Kept>) {
-        self.slots.set(at, kept);
+    unsafe fn put(&self, at: usize, words: [u64; 3], kept: Option<Kept>, write: bool) {
+        self.slots.set(at, kept, write);
         // SAFETY: the caller's entry.
         unsafe { views::write(at, words) }
+    }
+
+    /// Notes a new buffer's GPU range (dropping entries whose buffers are
+    /// gone now and then).
+    fn remember(&self, buffer: &Buffer) {
+        let mut all = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        all.insert(
+            buffer.gpuAddress(),
+            (buffer.length() as u64, Weak::from_retained(buffer)),
+        );
+        if all.len().is_multiple_of(1024) {
+            all.retain(|_, (_, b)| b.load().is_some());
+        }
+    }
+
+    /// The live buffer made here that holds GPU `address`.
+    fn buffer_at(&self, address: u64) -> Option<Buffer> {
+        let all = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, (len, b)) = all.range(..=address).next_back()?;
+        if address >= start + len {
+            return None;
+        }
+        b.load()
     }
 
     fn texture_entry(
@@ -231,6 +262,7 @@ impl Device for MetalDevice {
                 .device
                 .newBufferWithLength_options(desc.width.max(1) as usize, buffer_options(memory))
                 .ok_or(MetalError::Failed("a buffer"))?;
+            self.remember(&buffer);
             return Ok(MetalResource::Buffer(buffer));
         }
         let d = texture_descriptor(desc, storage(memory))?;
@@ -321,9 +353,9 @@ impl Device for MetalDevice {
                     offset as usize,
                 )
             };
-            return buffer
-                .map(MetalResource::Buffer)
-                .ok_or(MetalError::Failed("a placed buffer"));
+            let buffer = buffer.ok_or(MetalError::Failed("a placed buffer"))?;
+            self.remember(&buffer);
+            return Ok(MetalResource::Buffer(buffer));
         }
         let d = texture_descriptor(desc, heap.storageMode())?;
         // SAFETY: as above.
@@ -379,7 +411,7 @@ impl Device for MetalDevice {
                 .map_err(|e| MetalError::Shader(e.to_string()))?;
             converted = crate::irconverter::compute(dxil, &entry, given.then_some(&rs))?;
             threads = converted.threads;
-            top = TopLevel::new(&rs);
+            top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
             abi = Abi::Converted;
             code = ShaderCode::MetalLib(&converted.metallib);
         }
@@ -442,15 +474,19 @@ impl Device for MetalDevice {
         let (words, kept) = match resource {
             None => ([0; 3], None),
             Some(MetalResource::Buffer(b)) => match desc {
-                Some(d) if d.dimension == view::BUFFER => {
-                    (views::buffer_entry(b, d.buffer(), d.format), None)
-                }
-                _ => ([b.gpuAddress(), 0, b.length() as u64], None),
+                Some(d) if d.dimension == view::BUFFER => (
+                    views::buffer_entry(b, d.buffer(), d.format),
+                    Some(Kept::Buffer(b.clone())),
+                ),
+                _ => (
+                    [b.gpuAddress(), 0, b.length() as u64],
+                    Some(Kept::Buffer(b.clone())),
+                ),
             },
             Some(MetalResource::Texture(t)) => Self::texture_entry(views::shader_texture(t, desc)),
         };
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, words, kept) }
+        unsafe { self.put(at, words, kept, false) }
     }
 
     unsafe fn unordered_view(
@@ -462,22 +498,29 @@ impl Device for MetalDevice {
         let (words, kept) = match resource {
             None => ([0; 3], None),
             Some(MetalResource::Buffer(b)) => match desc {
-                Some(d) if d.dimension == view::BUFFER => {
-                    (views::buffer_entry(b, d.buffer(), d.format), None)
-                }
-                _ => ([b.gpuAddress(), 0, b.length() as u64], None),
+                Some(d) if d.dimension == view::BUFFER => (
+                    views::buffer_entry(b, d.buffer(), d.format),
+                    Some(Kept::Buffer(b.clone())),
+                ),
+                _ => (
+                    [b.gpuAddress(), 0, b.length() as u64],
+                    Some(Kept::Buffer(b.clone())),
+                ),
             },
             Some(MetalResource::Texture(t)) => {
                 Self::texture_entry(views::unordered_texture(t, desc))
             }
         };
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, words, kept) }
+        unsafe { self.put(at, words, kept, true) }
     }
 
+    /// The buffer holding `address` is looked up among those made here,
+    /// so dispatches can make it resident.
     unsafe fn constant_view(&self, address: u64, bytes: u32, at: usize) {
+        let kept = self.buffer_at(address).map(Kept::Buffer);
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, [address, 0, u64::from(bytes)], None) }
+        unsafe { self.put(at, [address, 0, u64::from(bytes)], kept, false) }
     }
 
     unsafe fn sampler(&self, desc: &SamplerDesc, at: usize) {
@@ -493,7 +536,7 @@ impl Device for MetalDevice {
             None => ([0; 3], None),
         };
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, words, kept) }
+        unsafe { self.put(at, words, kept, false) }
     }
 
     unsafe fn target_view(
@@ -514,7 +557,7 @@ impl Device for MetalDevice {
             None => ([0; 3], None),
         };
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, words, kept) }
+        unsafe { self.put(at, words, kept, false) }
     }
 
     unsafe fn depth_view(
@@ -534,7 +577,7 @@ impl Device for MetalDevice {
             _ => ([0; 3], None),
         };
         // SAFETY: the caller's slot.
-        unsafe { self.put(at, words, kept) }
+        unsafe { self.put(at, words, kept, false) }
     }
 
     unsafe fn copy_descriptors(&self, count: u32, to: usize, from: usize, _kind: Descriptors) {
@@ -862,6 +905,7 @@ mod tests {
                 &pipeline,
                 &[1000],
                 &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
+                &[],
                 [4, 1, 1],
             )
         };
@@ -930,6 +974,7 @@ mod tests {
                 &pipeline,
                 &[1000],
                 &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
+                &[],
                 [4, 1, 1],
             )
         };
@@ -1001,6 +1046,7 @@ mod tests {
                 &pipeline,
                 &[3, 1000],
                 &[Binding::Write(&out, 0), Binding::Read(&input, 0)],
+                &[],
                 [8, 1, 1],
             )
         };
@@ -1010,6 +1056,116 @@ mod tests {
             assert_eq!(
                 unsafe { got.add(n).read() },
                 n as u32 * 3 + 1000,
+                "element {n}"
+            );
+        }
+    }
+
+    /// Resources through a descriptor table: SRV, UAV and CBV at slots
+    /// 5..8 of a view heap, the input buffer placed in a heap (`useHeap`),
+    /// the others committed (`useResource`), the CBV found by address.
+    /// Needs Metal Shader Converter and `tests/fixtures/table.dxil` (see
+    /// table.hlsl); skips without the fixture.
+    #[test]
+    fn descriptor_table_runs_on_the_gpu() {
+        use objc2_metal::MTLResource as _;
+        use victory_host::{ComputeDesc, Recorder as _, ShaderCode, Table, UnorderedViewDesc};
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/table.dxil");
+        let Ok(dxil) = std::fs::read(fixture) else {
+            eprintln!("skipped: no {fixture}");
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &[],
+                threads: [0; 3],
+            })
+            .expect("Metal Shader Converter converts the shader");
+        let offsets: Vec<u32> = pipeline.top.entries.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, [0, 8], "constants, then the table's address");
+        let count = 256u32;
+        let bytes = u64::from(count) * 4;
+        let buffer = ResourceDesc::buffer(bytes, 0);
+        let alloc = gpu.allocation(&buffer);
+        let heap = gpu
+            .heap(Memory::Upload, alloc.size.max(65536), alloc.alignment, HeapUse::Buffers)
+            .unwrap();
+        let input = gpu.placed(&heap, 0, &buffer, state::GENERIC_READ).unwrap();
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let cb = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(256, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let (MetalResource::Buffer(i), MetalResource::Buffer(o), MetalResource::Buffer(c)) =
+            (&input, &out, &cb)
+        else {
+            unreachable!()
+        };
+        assert!(i.heap().is_some(), "the input is placed");
+        let values = i.contents().as_ptr().cast::<u32>();
+        for n in 0..count as usize {
+            unsafe { values.add(n).write(n as u32) };
+        }
+        unsafe { c.contents().as_ptr().cast::<u32>().write(5) };
+        let views = gpu.descriptor_heap(Descriptors::Views, 16, true).unwrap();
+        let at = |n: usize| gpu.descriptor_start(&views) + n * DESCRIPTOR_BYTES as usize;
+        let structured = u64::from(count) | (4 << 32);
+        unsafe {
+            gpu.shader_view(
+                Some(&input),
+                Some(&ShaderViewDesc {
+                    format: 0,
+                    dimension: view::BUFFER,
+                    mapping: 0x1688,
+                    _pad: 0,
+                    fields: [0, structured, 0],
+                }),
+                at(5),
+            );
+            gpu.unordered_view(
+                Some(&out),
+                Some(&UnorderedViewDesc {
+                    format: 0,
+                    dimension: view::BUFFER,
+                    fields: [0, structured, 0, 0],
+                }),
+                at(6),
+            );
+            gpu.constant_view(c.gpuAddress(), 256, at(7));
+        }
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.dispatch(
+                &pipeline,
+                &[1000],
+                &[],
+                &[Table {
+                    heap: &views,
+                    first: 5,
+                }],
+                [count / 64, 1, 1],
+            )
+        };
+        rec.commit_and_wait().expect("the dispatch runs");
+        let got = o.contents().as_ptr().cast::<u32>();
+        for n in 0..count as usize {
+            assert_eq!(
+                unsafe { got.add(n).read() },
+                n as u32 * 5 + 1000,
                 "element {n}"
             );
         }
@@ -1031,7 +1187,7 @@ mod tests {
                 && (r.count == root::UNBOUNDED || slot < r.register + r.count)
         };
         let check = |name: &str, rs: RootSignature| {
-            let top = crate::toplevel::TopLevel::new(&rs);
+            let top = crate::toplevel::TopLevel::new(&rs).unwrap();
             let locations = crate::irconverter::locations(&rs).expect("MSC takes the root signature");
             eprintln!("{name}: ours {:?}", top.entries);
             let mut matched = 0;
