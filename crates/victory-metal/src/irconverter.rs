@@ -7,9 +7,9 @@
 //! descriptor per binding) that is: the constants inline, then one 64-bit
 //! GPU address per binding, each at its natural alignment.
 //!
+//! The layout rule above is confirmed on a GPU (`converted_dxil_runs_on_the_gpu`).
 //! TODO(3b): root signatures handed in separately (the serialized blob in
-//! `ComputeDesc::root_signature`) need turning into MSC's descriptor; and
-//! the layout rule above wants checking against a real converted shader.
+//! `ComputeDesc::root_signature`) need turning into MSC's descriptor.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;
