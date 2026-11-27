@@ -12,7 +12,7 @@ use std::ffi::CStr;
 use std::sync::OnceLock;
 
 use saxaboom::{IRRootSignature, MetalIrConverter, ffi};
-use victory_host::root::{Kind, RootSignature, Version};
+use victory_host::root::{Kind, RootSignature};
 
 use crate::MetalError;
 
@@ -177,7 +177,7 @@ fn sampler(
     })
 }
 
-/// `rs` as MSC's root signature object. The descriptor's arrays live on
+/// `rs` as MSC's root signature object (always as version 1.1). The descriptor's arrays live on
 /// this stack frame; MSC copies what it keeps.
 pub(crate) fn root_signature(rs: &RootSignature) -> Result<IRRootSignature, MetalError> {
     let c = converter()?;
@@ -187,179 +187,95 @@ pub(crate) fn root_signature(rs: &RootSignature) -> Result<IRRootSignature, Meta
         .map(sampler)
         .collect::<Result<Vec<_>, _>>()?;
     let flags = ffi::IRRootSignatureFlags(rs.flags);
-    let made = match rs.version {
-        Version::V1_0 => {
-            let ranges = rs
-                .parameters
-                .iter()
-                .map(|p| match &p.kind {
-                    Kind::Table(ranges) => ranges
-                        .iter()
-                        .map(|r| {
-                            Ok(ffi::IRDescriptorRange {
-                                RangeType: range_type(r.kind)?,
-                                NumDescriptors: r.count,
-                                BaseShaderRegister: r.register,
-                                RegisterSpace: r.space,
-                                OffsetInDescriptorsFromTableStart: r.offset,
-                            })
+    // MSC takes version 1.1 descriptors only ("Unsupported root signature
+    // version" for 1.0), so 1.0 is read as D3D12 reads it.
+    let rs = &rs.to_v1_1();
+    let made = {
+        let mut ranges = rs
+            .parameters
+            .iter()
+            .map(|p| match &p.kind {
+                Kind::Table(ranges) => ranges
+                    .iter()
+                    .map(|r| {
+                        Ok(ffi::IRDescriptorRange1 {
+                            RangeType: range_type(r.kind)?,
+                            NumDescriptors: r.count,
+                            BaseShaderRegister: r.register,
+                            RegisterSpace: r.space,
+                            Flags: ffi::IRDescriptorRangeFlags(r.flags),
+                            OffsetInDescriptorsFromTableStart: r.offset,
                         })
-                        .collect::<Result<Vec<_>, MetalError>>(),
-                    _ => Ok(Vec::new()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let parameters = rs
-                .parameters
-                .iter()
-                .zip(&ranges)
-                .map(|(p, ranges)| {
-                    let (t, u_1) = match p.kind {
-                        Kind::Table(_) => (
-                            0,
-                            ffi::IRRootParameter_u {
-                                DescriptorTable: ffi::IRRootDescriptorTable {
-                                    NumDescriptorRanges: ranges.len() as u32,
-                                    pDescriptorRanges: ranges.as_ptr(),
-                                },
-                            },
-                        ),
-                        Kind::Constants {
-                            register,
-                            space,
-                            count,
-                        } => (
-                            1,
-                            ffi::IRRootParameter_u {
-                                Constants: ffi::IRRootConstants {
-                                    ShaderRegister: register,
-                                    RegisterSpace: space,
-                                    Num32BitValues: count,
-                                },
-                            },
-                        ),
-                        Kind::Descriptor {
-                            kind,
-                            register,
-                            space,
-                            ..
-                        } => (
-                            kind,
-                            ffi::IRRootParameter_u {
-                                Descriptor: ffi::IRRootDescriptor {
-                                    ShaderRegister: register,
-                                    RegisterSpace: space,
-                                },
-                            },
-                        ),
-                    };
-                    Ok(ffi::IRRootParameter {
-                        ParameterType: parameter_type(t)?,
-                        u_1,
-                        ShaderVisibility: visibility(p.visibility)?,
                     })
+                    .collect::<Result<Vec<_>, MetalError>>(),
+                _ => Ok(Vec::new()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut parameters = rs
+            .parameters
+            .iter()
+            .zip(&mut ranges)
+            .map(|(p, ranges)| {
+                let (t, u_1) = match p.kind {
+                    Kind::Table(_) => (
+                        0,
+                        ffi::IRRootParameter1_u {
+                            DescriptorTable: ffi::IRRootDescriptorTable1 {
+                                NumDescriptorRanges: ranges.len() as u32,
+                                pDescriptorRanges: ranges.as_mut_ptr(),
+                            },
+                        },
+                    ),
+                    Kind::Constants {
+                        register,
+                        space,
+                        count,
+                    } => (
+                        1,
+                        ffi::IRRootParameter1_u {
+                            Constants: ffi::IRRootConstants {
+                                ShaderRegister: register,
+                                RegisterSpace: space,
+                                Num32BitValues: count,
+                            },
+                        },
+                    ),
+                    Kind::Descriptor {
+                        kind,
+                        register,
+                        space,
+                        flags,
+                    } => (
+                        kind,
+                        ffi::IRRootParameter1_u {
+                            Descriptor: ffi::IRRootDescriptor1 {
+                                ShaderRegister: register,
+                                RegisterSpace: space,
+                                Flags: ffi::IRRootDescriptorFlags(flags),
+                            },
+                        },
+                    ),
+                };
+                Ok(ffi::IRRootParameter1 {
+                    ParameterType: parameter_type(t)?,
+                    u_1,
+                    ShaderVisibility: visibility(p.visibility)?,
                 })
-                .collect::<Result<Vec<_>, MetalError>>()?;
-            let desc = ffi::IRVersionedRootSignatureDescriptor {
-                version: ffi::IRRootSignatureVersion::_1,
-                u_1: ffi::IRVersionedRootSignatureDescriptor_u {
-                    desc_1_0: ffi::IRRootSignatureDescriptor {
-                        NumParameters: parameters.len() as u32,
-                        pParameters: parameters.as_ptr(),
-                        NumStaticSamplers: samplers.len() as u32,
-                        pStaticSamplers: samplers.as_ptr(),
-                        Flags: flags,
-                    },
+            })
+            .collect::<Result<Vec<_>, MetalError>>()?;
+        let desc = ffi::IRVersionedRootSignatureDescriptor {
+            version: ffi::IRRootSignatureVersion::_1_1,
+            u_1: ffi::IRVersionedRootSignatureDescriptor_u {
+                desc_1_1: ffi::IRRootSignatureDescriptor1 {
+                    NumParameters: parameters.len() as u32,
+                    pParameters: parameters.as_mut_ptr(),
+                    NumStaticSamplers: samplers.len() as u32,
+                    pStaticSamplers: samplers.as_mut_ptr(),
+                    Flags: flags,
                 },
-            };
-            c.create_root_signature_from_descriptor(&desc)
-        }
-        Version::V1_1 => {
-            let mut ranges = rs
-                .parameters
-                .iter()
-                .map(|p| match &p.kind {
-                    Kind::Table(ranges) => ranges
-                        .iter()
-                        .map(|r| {
-                            Ok(ffi::IRDescriptorRange1 {
-                                RangeType: range_type(r.kind)?,
-                                NumDescriptors: r.count,
-                                BaseShaderRegister: r.register,
-                                RegisterSpace: r.space,
-                                Flags: ffi::IRDescriptorRangeFlags(r.flags),
-                                OffsetInDescriptorsFromTableStart: r.offset,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, MetalError>>(),
-                    _ => Ok(Vec::new()),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut parameters = rs
-                .parameters
-                .iter()
-                .zip(&mut ranges)
-                .map(|(p, ranges)| {
-                    let (t, u_1) = match p.kind {
-                        Kind::Table(_) => (
-                            0,
-                            ffi::IRRootParameter1_u {
-                                DescriptorTable: ffi::IRRootDescriptorTable1 {
-                                    NumDescriptorRanges: ranges.len() as u32,
-                                    pDescriptorRanges: ranges.as_mut_ptr(),
-                                },
-                            },
-                        ),
-                        Kind::Constants {
-                            register,
-                            space,
-                            count,
-                        } => (
-                            1,
-                            ffi::IRRootParameter1_u {
-                                Constants: ffi::IRRootConstants {
-                                    ShaderRegister: register,
-                                    RegisterSpace: space,
-                                    Num32BitValues: count,
-                                },
-                            },
-                        ),
-                        Kind::Descriptor {
-                            kind,
-                            register,
-                            space,
-                            flags,
-                        } => (
-                            kind,
-                            ffi::IRRootParameter1_u {
-                                Descriptor: ffi::IRRootDescriptor1 {
-                                    ShaderRegister: register,
-                                    RegisterSpace: space,
-                                    Flags: ffi::IRRootDescriptorFlags(flags),
-                                },
-                            },
-                        ),
-                    };
-                    Ok(ffi::IRRootParameter1 {
-                        ParameterType: parameter_type(t)?,
-                        u_1,
-                        ShaderVisibility: visibility(p.visibility)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, MetalError>>()?;
-            let desc = ffi::IRVersionedRootSignatureDescriptor {
-                version: ffi::IRRootSignatureVersion::_1_1,
-                u_1: ffi::IRVersionedRootSignatureDescriptor_u {
-                    desc_1_1: ffi::IRRootSignatureDescriptor1 {
-                        NumParameters: parameters.len() as u32,
-                        pParameters: parameters.as_mut_ptr(),
-                        NumStaticSamplers: samplers.len() as u32,
-                        pStaticSamplers: samplers.as_mut_ptr(),
-                        Flags: flags,
-                    },
-                },
-            };
-            c.create_root_signature_from_descriptor(&desc)
-        }
+            },
+        };
+        c.create_root_signature_from_descriptor(&desc)
     };
     made.map_err(|e| MetalError::Shader(format!("Metal Shader Converter: {e:?}")))
 }

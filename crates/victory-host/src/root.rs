@@ -338,6 +338,36 @@ pub fn table_starts(ranges: &[Range]) -> Result<Vec<u32>, RootError> {
 }
 
 impl RootSignature {
+    /// As version 1.1, the way D3D12 reads a 1.0 root signature: root
+    /// descriptors `DATA_VOLATILE`, ranges `DESCRIPTORS_VOLATILE |
+    /// DATA_VOLATILE` (sampler ranges only `DESCRIPTORS_VOLATILE`). A 1.1
+    /// one comes back as it is.
+    pub fn to_v1_1(&self) -> RootSignature {
+        const DESCRIPTORS_VOLATILE: u32 = 1;
+        const DATA_VOLATILE: u32 = 2;
+        let mut out = self.clone();
+        if self.version == Version::V1_1 {
+            return out;
+        }
+        out.version = Version::V1_1;
+        for p in &mut out.parameters {
+            match &mut p.kind {
+                Kind::Descriptor { flags, .. } => *flags = DATA_VOLATILE,
+                Kind::Table(ranges) => {
+                    for r in ranges {
+                        r.flags = if r.kind == range::SAMPLER {
+                            DESCRIPTORS_VOLATILE
+                        } else {
+                            DESCRIPTORS_VOLATILE | DATA_VOLATILE
+                        };
+                    }
+                }
+                Kind::Constants { .. } => {}
+            }
+        }
+        out
+    }
+
     /// Serialized as D3D12 does (dxc's byte order), in a DXBC container.
     /// The container hash is left zero: this is for tests and for the
     /// backends that read the blob themselves (Metal), not for D3D12.
@@ -611,6 +641,29 @@ mod tests {
         };
         assert_eq!((ranges[0].count, ranges[0].flags), (2, 1));
         assert_eq!(table_starts(ranges).unwrap(), [0, 2]);
+    }
+
+    #[test]
+    fn version_1_0_reads_as_volatile_1_1() {
+        let rs = parse(&samples::RS10).unwrap().to_v1_1();
+        assert_eq!(rs.version, Version::V1_1);
+        let Kind::Descriptor { flags, .. } = rs.parameters[1].kind else {
+            panic!("a root CBV")
+        };
+        assert_eq!(flags, 2, "DATA_VOLATILE");
+        let Kind::Table(ranges) = &rs.parameters[4].kind else {
+            panic!("a table")
+        };
+        assert!(ranges.iter().all(|r| r.flags == 3));
+        let Kind::Table(samplers) = &rs.parameters[5].kind else {
+            panic!("a table")
+        };
+        assert_eq!(samplers[0].flags, 1, "samplers: DESCRIPTORS_VOLATILE only");
+        assert_eq!(rs.samplers, parse(&samples::RS10).unwrap().samplers);
+        // Offsets, registers and the rest are untouched; 1.1 stays as is.
+        assert_eq!(ranges[2].offset, 8);
+        let v11 = parse(&samples::RS11).unwrap();
+        assert_eq!(v11.to_v1_1(), v11);
     }
 
     #[test]
