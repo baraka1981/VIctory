@@ -3,7 +3,10 @@
 //! natural alignment. Root constants are their 32-bit values inline (4-byte
 //! aligned); a root CBV / SRV / UAV is one 64-bit GPU address, and a
 //! descriptor table the 64-bit GPU address of its first entry (8-byte
-//! aligned). Static samplers take no room.
+//! aligned). Static samplers, if any, take one more 8-byte address after
+//! the last parameter: a descriptor table of one sampler entry per static
+//! sampler, in order, which the backend builds (MSC's layout, seen on the
+//! Mac).
 //!
 //! A table's entry points at descriptor `first` of a heap; its ranges say
 //! which descriptors from there the shader may read ([`TopLevel::reached`]),
@@ -50,6 +53,8 @@ pub struct TopLevel {
     pub entries: Vec<Entry>,
     /// Each table's ranges, in table order.
     pub tables: Vec<Vec<Span>>,
+    /// Where the static samplers' table address goes, if there are any.
+    pub statics: Option<u32>,
     pub bytes: u32,
 }
 
@@ -81,9 +86,15 @@ impl TopLevel {
             at = offset + size;
             entries.push(Entry { slot, offset });
         }
+        let statics = (!rs.samplers.is_empty()).then(|| {
+            let offset = at.next_multiple_of(8);
+            at = offset + 8;
+            offset
+        });
         Ok(TopLevel {
             entries,
             tables,
+            statics,
             bytes: at.next_multiple_of(8),
         })
     }
@@ -121,8 +132,14 @@ impl TopLevel {
 
     /// The buffer for one dispatch: constants fill the constants entries
     /// in order, `addresses` the root descriptors, `tables` the tables
-    /// (missing ones read as zero).
-    pub fn fill(&self, constants: &[u32], addresses: &[u64], tables: &[u64]) -> Vec<u8> {
+    /// (missing ones read as zero), `statics` the static samplers' table.
+    pub fn fill(
+        &self,
+        constants: &[u32],
+        addresses: &[u64],
+        tables: &[u64],
+        statics: u64,
+    ) -> Vec<u8> {
         let mut out = vec![0u8; self.bytes.max(8) as usize];
         let (mut c, mut a, mut t) = (constants.iter(), addresses.iter(), tables.iter());
         for e in &self.entries {
@@ -142,6 +159,10 @@ impl TopLevel {
                     out[at..at + 8].copy_from_slice(&v.to_le_bytes());
                 }
             }
+        }
+        if let Some(at) = self.statics {
+            let at = at as usize;
+            out[at..at + 8].copy_from_slice(&statics.to_le_bytes());
         }
         out
     }
@@ -239,8 +260,8 @@ mod tests {
         let top = TopLevel::new(&rs).unwrap();
         let offsets: Vec<u32> = top.entries.iter().map(|e| e.offset).collect();
         assert_eq!(offsets, [0, 8, 16]);
-        assert_eq!(top.bytes, 24);
-        let ab = top.fill(&[7], &[0x1000, 0x2000], &[]);
+        assert_eq!((top.bytes, top.statics), (24, None));
+        let ab = top.fill(&[7], &[0x1000, 0x2000], &[], 0);
         assert_eq!(ab.len(), 24);
         assert_eq!(&ab[0..4], &7u32.to_le_bytes());
         assert_eq!(&ab[8..16], &0x1000u64.to_le_bytes());
@@ -280,13 +301,16 @@ mod tests {
                 },
             ]
         );
-        assert_eq!((top.bytes, top.descriptors()), (56, 3));
-        let ab = top.fill(&[1, 2, 3], &[0xa, 0xb], &[0x7000]);
+        // RS10's static sampler: one more address, after the last table.
+        assert_eq!(top.statics, Some(56));
+        assert_eq!((top.bytes, top.descriptors()), (64, 3));
+        let ab = top.fill(&[1, 2, 3], &[0xa, 0xb], &[0x7000], 0x9000);
         assert_eq!(&ab[0..12], &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]);
         assert_eq!(&ab[16..24], &0xau64.to_le_bytes());
         assert_eq!(&ab[24..32], &0xbu64.to_le_bytes());
         assert_eq!(&ab[32..40], &[0; 8], "a missing binding reads as null");
         assert_eq!(&ab[40..48], &0x7000u64.to_le_bytes());
+        assert_eq!(&ab[56..64], &0x9000u64.to_le_bytes());
     }
 
     #[test]
@@ -319,13 +343,27 @@ mod tests {
     }
 
     #[test]
+    fn static_samplers_follow_aligned() {
+        // Constants(3) then the static sampler table, as MSC put it: 16.
+        let rs10 = root::parse(&samples::RS10).unwrap();
+        let rs = RootSignature {
+            parameters: rs10.parameters[..1].to_vec(),
+            ..rs10
+        };
+        let top = TopLevel::new(&rs).unwrap();
+        assert_eq!((top.statics, top.bytes), (Some(16), 24));
+        let ab = top.fill(&[1, 2, 3], &[], &[], 0xabc);
+        assert_eq!(&ab[16..24], &0xabcu64.to_le_bytes());
+    }
+
+    #[test]
     fn addresses_before_constants() {
         // UAV, constants(2), SRV: the order the swap.hlsl test uses.
         let rs = root::parse(&swap_root_signature().serialize()).unwrap();
         let top = TopLevel::new(&rs).unwrap();
         let offsets: Vec<u32> = top.entries.iter().map(|e| e.offset).collect();
         assert_eq!(offsets, [0, 8, 16]);
-        let ab = top.fill(&[3, 1000], &[0x1000, 0x2000], &[]);
+        let ab = top.fill(&[3, 1000], &[0x1000, 0x2000], &[], 0);
         assert_eq!(&ab[0..8], &0x1000u64.to_le_bytes());
         assert_eq!(&ab[8..16], &[3, 0, 0, 0, 0xe8, 0x03, 0, 0]);
         assert_eq!(&ab[16..24], &0x2000u64.to_le_bytes());

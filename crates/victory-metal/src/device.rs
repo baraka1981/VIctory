@@ -57,6 +57,21 @@ pub enum Abi {
     Converted,
 }
 
+/// A root signature's static samplers as Metal Shader Converter reads
+/// them: a descriptor table of sampler entries, in order, whose address
+/// goes in the top-level argument buffer (`TopLevel::statics`).
+pub struct StaticSamplers {
+    pub table: Buffer,
+    /// Kept alive while the table names them.
+    _samplers: Vec<Retained<ProtocolObject<dyn MTLSamplerState>>>,
+}
+
+impl StaticSamplers {
+    pub fn address(this: Option<&StaticSamplers>) -> u64 {
+        this.map_or(0, |s| s.table.gpuAddress())
+    }
+}
+
 /// A compute pipeline and the group size its shader declares.
 pub struct MetalPipeline {
     pub state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
@@ -65,6 +80,8 @@ pub struct MetalPipeline {
     /// The top-level argument buffer's layout ([`Abi::Converted`]; empty
     /// for [`Abi::Direct`]).
     pub top: TopLevel,
+    /// The root signature's static samplers, if it has any.
+    pub statics: Option<StaticSamplers>,
 }
 
 pub struct MetalDevice {
@@ -143,6 +160,58 @@ impl MetalDevice {
             return None;
         }
         b.load()
+    }
+
+    /// `rs`'s static samplers as a table of sampler entries (`None` when
+    /// it has none).
+    pub(crate) fn static_samplers(
+        &self,
+        rs: &victory_host::root::RootSignature,
+    ) -> Result<Option<StaticSamplers>, MetalError> {
+        if rs.samplers.is_empty() {
+            return Ok(None);
+        }
+        let table = self
+            .device
+            .newBufferWithLength_options(
+                rs.samplers.len() * DESCRIPTOR_BYTES as usize,
+                MTLResourceOptions::StorageModeShared,
+            )
+            .ok_or(MetalError::Failed("a static sampler table"))?;
+        let mut samplers = Vec::with_capacity(rs.samplers.len());
+        let base = table.contents().as_ptr() as usize;
+        for (i, s) in rs.samplers.iter().enumerate() {
+            let desc = SamplerDesc {
+                filter: s.filter,
+                address: s.address,
+                mip_lod_bias: s.mip_lod_bias,
+                max_anisotropy: s.max_anisotropy,
+                comparison: s.comparison,
+                // D3D12_STATIC_BORDER_COLOR: transparent black, opaque
+                // black, opaque white.
+                border: match s.border {
+                    1 => [0.0, 0.0, 0.0, 1.0],
+                    2 => [1.0, 1.0, 1.0, 1.0],
+                    _ => [0.0; 4],
+                },
+                min_lod: s.min_lod,
+                max_lod: s.max_lod,
+            };
+            let made = views::sampler(&self.device, &desc)
+                .ok_or(MetalError::Failed("a static sampler"))?;
+            let words = [
+                resource_id(made.gpuResourceID()),
+                0,
+                u64::from(s.mip_lod_bias.to_bits()),
+            ];
+            // SAFETY: entry `i` of the table just made.
+            unsafe { views::write(base + i * DESCRIPTOR_BYTES as usize, words) };
+            samplers.push(made);
+        }
+        Ok(Some(StaticSamplers {
+            table,
+            _samplers: samplers,
+        }))
     }
 
     /// Function `entry` of a library made from MSL source or a metallib.
@@ -453,9 +522,11 @@ impl Device for MetalDevice {
         let shader = |e: Retained<objc2_foundation::NSError>| {
             MetalError::Shader(e.localizedDescription().to_string())
         };
+        let mut statics = None;
         let (function, threads, abi, top) = match desc.code {
             ShaderCode::Dxil(dxil) => {
                 let (rs, given) = root_signature_for(desc.root_signature, dxil)?;
+                statics = self.static_samplers(&rs)?;
                 let c = crate::irconverter::convert(dxil, &c_entry(desc.entry)?, given.then_some(&rs))?;
                 let top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
                 let function = self.function(ShaderCode::MetalLib(&c.metallib), converted_entry())?;
@@ -477,6 +548,7 @@ impl Device for MetalDevice {
             threads,
             abi,
             top,
+            statics,
         })
     }
 
@@ -1523,6 +1595,96 @@ mod tests {
         }
     }
 
+    /// A root signature's static sampler on the GPU: point + clamp over a
+    /// 4x1 texture read through a table. Wrong or missing static sampler
+    /// table: no clamp (or no read) past the right edge. Needs Metal
+    /// Shader Converter and sampler.dxil.
+    #[test]
+    fn static_sampler_samples_on_the_gpu() {
+        use victory_host::{
+            ComputeDesc, Location, Recorder as _, ShaderCode, Table, UnorderedViewDesc,
+        };
+        let Some(dxil) = fixture("sampler.dxil") else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &[],
+                threads: [0; 3],
+            })
+            .expect("Metal Shader Converter converts the shader");
+        assert!(pipeline.statics.is_some(), "a static sampler table");
+        assert_eq!(pipeline.top.statics, Some(8), "after the one table");
+        let desc = texture(4, 1, 28, 0);
+        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
+        let mut fp = [victory_host::Footprint::default()];
+        let bytes = gpu.copy_layout(&desc, 0, &mut fp);
+        let texels: [[u8; 4]; 4] = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ];
+        let mut words = vec![0u32; bytes.div_ceil(4) as usize];
+        for (i, t) in texels.iter().enumerate() {
+            words[fp[0].offset as usize / 4 + i] = u32::from_le_bytes(*t);
+        }
+        let up = upload(&gpu, &words);
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(8 * 16, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let views = gpu.descriptor_heap(Descriptors::Views, 2, true).unwrap();
+        let at = |n: usize| gpu.descriptor_start(&views) + n * DESCRIPTOR_BYTES as usize;
+        unsafe {
+            gpu.shader_view(Some(&tex), None, at(0));
+            gpu.unordered_view(
+                Some(&out),
+                Some(&UnorderedViewDesc {
+                    format: 0,
+                    dimension: view::BUFFER,
+                    fields: [0, 8 | (16 << 32), 0, 0],
+                }),
+                at(1),
+            );
+        }
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.copy_texture(
+                Location::Subresource(&tex, 0),
+                [0, 0, 0],
+                Location::Footprint(&up, fp[0]),
+                None,
+            );
+            rec.dispatch(
+                &pipeline,
+                &[],
+                &[],
+                &[Table {
+                    heap: &views,
+                    first: 0,
+                }],
+                [1, 1, 1],
+            );
+        }
+        rec.commit_and_wait().expect("the dispatch runs");
+        let MetalResource::Buffer(o) = &out else {
+            unreachable!()
+        };
+        let got = o.contents().as_ptr().cast::<[f32; 4]>();
+        for i in 0..8 {
+            let want = texels[i.min(3)].map(|c| f32::from(c) / 255.0);
+            assert_eq!(unsafe { got.add(i).read() }, want, "thread {i}");
+        }
+    }
+
     /// crate::toplevel's offsets against where MSC itself says each
     /// resource goes, for every parameter kind (RS10: constants, root
     /// CBV/SRV/UAV, tables incl. unbounded and samplers, a static sampler;
@@ -1540,7 +1702,7 @@ mod tests {
         };
         let problems = std::cell::RefCell::new(Vec::<String>::new());
         let check = |name: &str, rs: RootSignature| {
-            let top = crate::toplevel::TopLevel::new(&rs).unwrap();
+            let mut top = crate::toplevel::TopLevel::new(&rs).unwrap();
             let locations = crate::irconverter::locations(&rs).expect("MSC takes the root signature");
             eprintln!("{name}: ours {:?}", top.entries);
             let mut matched = 0;
@@ -1551,7 +1713,8 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(_, p)| matches!(p.kind, Kind::Table(_)))
-                .map(|(i, _)| i);
+                .map(|(i, _)| i)
+                .collect::<std::collections::VecDeque<_>>();
             for l in &locations {
                 eprintln!(
                     "{name}: MSC {:?} space {} slot {} at {} ({} bytes)",
@@ -1566,8 +1729,18 @@ mod tests {
                     T::Table => (None, None),
                     _ => (None, None),
                 };
+                if l.resourceType == T::Table && table_params.is_empty() {
+                    // Past the tables: the static samplers' table.
+                    assert_eq!(
+                        Some(l.topLevelOffset),
+                        top.statics.take(),
+                        "{name}: the static samplers' table (once)"
+                    );
+                    matched += 1;
+                    continue;
+                }
                 let found = if l.resourceType == T::Table {
-                    table_params.next()
+                    table_params.pop_front()
                 } else {
                     rs.parameters.iter().position(|p| match &p.kind {
                     Kind::Constants { register, space, .. } => {
@@ -1605,6 +1778,7 @@ mod tests {
                 }
             }
             assert!(matched > 0, "{name}: MSC reported nothing to compare");
+            assert_eq!(top.statics, None, "{name}: MSC listed no static sampler table");
         };
         if let Err(MetalError::Shader(why)) =
             crate::irconverter::locations(&crate::toplevel::swap_root_signature())
@@ -1631,6 +1805,14 @@ mod tests {
                 ..rs10.clone()
             },
         );
+        // Two static samplers: still one table entry (one sampler entry
+        // each inside it).
+        let mut two = rs10.clone();
+        two.samplers.push(victory_host::root::StaticSampler {
+            register: 5,
+            ..rs10.samplers[0]
+        });
+        check("two-static", two);
         check("RS11", root::parse(&samples::RS11).unwrap());
         check("swap", crate::toplevel::swap_root_signature());
         let problems = problems.into_inner();

@@ -31,7 +31,9 @@ mod render;
 #[cfg(target_os = "macos")]
 mod views;
 #[cfg(target_os = "macos")]
-pub use device::{Abi, MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource};
+pub use device::{
+    Abi, MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource, StaticSamplers,
+};
 #[cfg(target_os = "macos")]
 pub use record::MetalRecorder;
 #[cfg(target_os = "macos")]

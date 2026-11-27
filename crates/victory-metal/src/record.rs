@@ -22,7 +22,7 @@ use victory_host::{
     Arguments, Barrier, Binding, Draw, Location, Pass, Recorder, Region, Table, Vertices,
 };
 
-use crate::device::{Abi, MetalDescriptorHeap, MetalPipeline, MetalResource};
+use crate::device::{Abi, MetalDescriptorHeap, MetalPipeline, MetalResource, StaticSamplers};
 use crate::render::{Kind, MetalGraphicsPipeline};
 use crate::toplevel::TopLevel;
 use crate::views::{Resident, Slots, Target};
@@ -61,7 +61,8 @@ impl MetalRecorder {
     }
 
     /// Resources a converted shader reaches only through addresses: root
-    /// descriptors' buffers, the tables' descriptor buffers, and what the
+    /// descriptors' buffers, the tables' and static samplers' descriptor
+    /// buffers, and what the
     /// descriptors the root signature's ranges cover name. Those placed in
     /// a heap go resident a heap at a time (`useHeap`), the rest one by one
     /// (`useResource`, read-write for unordered access views).
@@ -70,6 +71,7 @@ impl MetalRecorder {
         top: &TopLevel,
         bindings: &[Binding<'_, MetalResource>],
         tables: &[Table<'_, MetalDescriptorHeap>],
+        statics: Option<&StaticSamplers>,
     ) -> Residency {
         let mut out = Residency::default();
         let mut add = |resource: Retained<ProtocolObject<dyn MTLResource>>, writes: bool| {
@@ -96,6 +98,9 @@ impl MetalRecorder {
             if let MetalResource::Buffer(buf) = r {
                 add(ProtocolObject::from_retained(buf.clone()), writes);
             }
+        }
+        if let Some(s) = statics {
+            add(ProtocolObject::from_retained(s.table.clone()), false);
         }
         let mut named = Vec::new();
         for (k, t) in tables.iter().enumerate() {
@@ -264,7 +269,13 @@ impl MetalRecorder {
             .iter()
             .map(|t| t.heap.table.gpuAddress() + u64::from(t.first) * u64::from(DESCRIPTOR_BYTES))
             .collect();
-        let top = pipeline.top.fill(args.constants, &addresses, &starts);
+        let statics = pipeline.statics.as_ref();
+        let top = pipeline.top.fill(
+            args.constants,
+            &addresses,
+            &starts,
+            StaticSamplers::address(statics),
+        );
         let stages = pipeline.stages;
         let bytes = std::ptr::NonNull::from(&top[0]).cast();
         let index = crate::irconverter::ARGUMENT_BUFFER_INDEX;
@@ -283,7 +294,7 @@ impl MetalRecorder {
                 enc.setFragmentBytes_length_atIndex(bytes, top.len(), index);
             }
         }
-        let residency = self.residency(&pipeline.top, args.bindings, args.tables);
+        let residency = self.residency(&pipeline.top, args.bindings, args.tables, statics);
         for h in &residency.heaps {
             enc.useHeap_stages(h, stages);
         }
@@ -414,7 +425,13 @@ impl Recorder for MetalRecorder {
                 .iter()
                 .map(|t| t.heap.table.gpuAddress() + u64::from(t.first) * u64::from(DESCRIPTOR_BYTES))
                 .collect();
-            let top = pipeline.top.fill(constants, &addresses, &starts);
+            let statics = pipeline.statics.as_ref();
+            let top = pipeline.top.fill(
+                constants,
+                &addresses,
+                &starts,
+                StaticSamplers::address(statics),
+            );
             unsafe {
                 enc.setBytes_length_atIndex(
                     std::ptr::NonNull::from(&top[0]).cast(),
@@ -422,7 +439,7 @@ impl Recorder for MetalRecorder {
                     crate::irconverter::ARGUMENT_BUFFER_INDEX,
                 );
             }
-            let residency = self.residency(&pipeline.top, bindings, tables);
+            let residency = self.residency(&pipeline.top, bindings, tables, statics);
             for h in &residency.heaps {
                 enc.useHeap(h);
             }

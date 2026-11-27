@@ -22,7 +22,7 @@ use saxaboom::ffi::IRShaderStage;
 use victory_host::{Blend, DepthTest, Geometry, GraphicsDesc, Raster, ShaderCode, Stage};
 
 use crate::MetalError;
-use crate::device::{MetalDevice, c_entry, converted_entry, root_signature_for};
+use crate::device::{MetalDevice, StaticSamplers, c_entry, converted_entry, root_signature_for};
 use crate::irconverter::{self, Converted, VERTEX_BUFFER_INDEX};
 use crate::toplevel::TopLevel;
 use crate::{format, vertex};
@@ -51,6 +51,8 @@ pub struct MetalGraphicsPipeline {
     /// The stages a draw binds the top-level argument buffer on, and
     /// makes resources resident for.
     pub stages: MTLRenderStages,
+    /// The root signature's static samplers, if it has any.
+    pub statics: Option<StaticSamplers>,
 }
 
 fn dxil<'a>(stage: &Stage<'a>) -> Result<&'a [u8], MetalError> {
@@ -261,6 +263,7 @@ pub(crate) fn pipeline(
     };
     let (rs, _) = root_signature_for(desc.root_signature, dxil(first)?)?;
     let top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
+    let statics = dev.static_samplers(&rs)?;
     let function =
         |c: &Converted| dev.function(ShaderCode::MetalLib(&c.metallib), converted_entry());
     let fragment = desc
@@ -386,5 +389,6 @@ pub(crate) fn pipeline(
         top,
         kind,
         stages,
+        statics,
     })
 }
