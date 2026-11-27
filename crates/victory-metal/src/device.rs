@@ -1538,6 +1538,7 @@ mod tests {
                 && slot >= r.register
                 && (r.count == root::UNBOUNDED || slot < r.register + r.count)
         };
+        let problems = std::cell::RefCell::new(Vec::<String>::new());
         let check = |name: &str, rs: RootSignature| {
             let top = crate::toplevel::TopLevel::new(&rs).unwrap();
             let locations = crate::irconverter::locations(&rs).expect("MSC takes the root signature");
@@ -1593,7 +1594,14 @@ mod tests {
                         matched += 1;
                     }
                     None if static_sampler => {}
-                    None => panic!("{name}: MSC location {l:?} matches no parameter"),
+                    None => {
+                        let p = format!(
+                            "{name}: MSC {:?} at {} ({} bytes) matches no parameter (ours end at {})",
+                            l.resourceType, l.topLevelOffset, l.sizeBytes, top.bytes
+                        );
+                        eprintln!("{p}");
+                        problems.borrow_mut().push(p);
+                    }
                 }
             }
             assert!(matched > 0, "{name}: MSC reported nothing to compare");
@@ -1605,9 +1613,28 @@ mod tests {
             eprintln!("skipped: {why}");
             return;
         }
-        check("RS10", root::parse(&samples::RS10).unwrap());
+        let rs10 = root::parse(&samples::RS10).unwrap();
+        check("RS10", rs10.clone());
+        // Telling an extra entry for static samplers from one for tables:
+        // RS10 without its static sampler, and constants + the sampler.
+        check(
+            "RS10-no-static",
+            RootSignature {
+                samplers: vec![],
+                ..rs10.clone()
+            },
+        );
+        check(
+            "static-only",
+            RootSignature {
+                parameters: rs10.parameters[..1].to_vec(),
+                ..rs10.clone()
+            },
+        );
         check("RS11", root::parse(&samples::RS11).unwrap());
         check("swap", crate::toplevel::swap_root_signature());
+        let problems = problems.into_inner();
+        assert!(problems.is_empty(), "{problems:#?}");
     }
 
     #[test]
