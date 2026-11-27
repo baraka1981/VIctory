@@ -5,7 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
-    Arguments, Binding, ComputeDesc, Draw, Geometry, GraphicsDesc, Pass, ShaderCode, Vertices,
+    Arguments, Binding, ComputeDesc, Draw, GraphicsDesc, Pass, ShaderCode, Vertices,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -397,6 +397,8 @@ impl D3d12List<'_> {
                 (v.y + v.height).max(0.0) as u32,
             ]);
             l.RSSetScissorRects(&[RECT { left: left as i32, top: top as i32, right: right as i32, bottom: bottom as i32 }]);
+            l.OMSetStencilRef(pass.stencil_ref);
+            l.OMSetBlendFactor(Some(&pass.blend_factor));
         }
     }
 }
@@ -711,122 +713,12 @@ impl Device for D3d12<'_> {
         }
     }
 
-    /// Vertex + pixel pipelines; mesh pipelines (a pipeline state stream)
-    /// are not done on D3D12 yet (`E_NOTIMPL`).
+    /// The descriptions built here are the ones victory-gpu made before
+    /// the seam (plain description; a stream with `DEPTH_STENCIL1` for
+    /// the depth bounds test; a stream for mesh pipelines, naming a
+    /// triangle topology), so pipeline library entries keep loading.
     fn graphics_pipeline(&self, desc: &GraphicsDesc<'_>) -> windows::core::Result<D3d12Pipeline> {
-        use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_OP, D3D12_COMPARISON_FUNC, D3D12_CULL_MODE,
-            D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_WRITE_MASK, D3D12_FILL_MODE,
-            D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
-            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC,
-            D3D12_INPUT_LAYOUT_DESC, D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_RASTERIZER_DESC,
-            D3D12_RENDER_TARGET_BLEND_DESC,
-        };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
-        let invalid = || windows::core::Error::from_hresult(E_INVALIDARG);
-        let dxil = |code: ShaderCode<'_>| match code {
-            ShaderCode::Dxil(d) => Ok(D3D12_SHADER_BYTECODE { pShaderBytecode: d.as_ptr().cast(), BytecodeLength: d.len() }),
-            _ => Err(invalid()),
-        };
-        let Geometry::Vertex { shader, inputs } = desc.geometry else {
-            return Err(windows::core::Error::from_hresult(E_NOTIMPL));
-        };
-        let ShaderCode::Dxil(vs) = shader.code else { return Err(invalid()) };
-        // No root signature given: the one embedded in the vertex shader.
-        let blob = if desc.root_signature.is_empty() { vs } else { desc.root_signature };
-        let parameters = victory_host::root::parse(blob)
-            .map_err(|_| invalid())?
-            .parameters
-            .into_iter()
-            .map(|p| p.kind)
-            .collect();
-        let names: Vec<std::ffi::CString> = inputs
-            .iter()
-            .map(|e| std::ffi::CString::new(e.semantic).map_err(|_| invalid()))
-            .collect::<Result<_, _>>()?;
-        let elements: Vec<D3D12_INPUT_ELEMENT_DESC> = inputs
-            .iter()
-            .zip(&names)
-            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
-                SemanticName: windows::core::PCSTR(name.as_ptr().cast()),
-                SemanticIndex: e.index,
-                Format: DXGI_FORMAT(e.format as i32),
-                InputSlot: e.slot,
-                AlignedByteOffset: e.offset,
-                InputSlotClass: if e.per_instance {
-                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
-                } else {
-                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
-                },
-                InstanceDataStepRate: if e.per_instance { e.step_rate } else { 0 },
-            })
-            .collect();
-        let blend = |b: &victory_host::Blend| D3D12_RENDER_TARGET_BLEND_DESC {
-            BlendEnable: b.enable.into(),
-            LogicOpEnable: false.into(),
-            SrcBlend: D3D12_BLEND(b.src as i32),
-            DestBlend: D3D12_BLEND(b.dst as i32),
-            BlendOp: D3D12_BLEND_OP(b.op as i32),
-            SrcBlendAlpha: D3D12_BLEND(b.src_alpha as i32),
-            DestBlendAlpha: D3D12_BLEND(b.dst_alpha as i32),
-            BlendOpAlpha: D3D12_BLEND_OP(b.op_alpha as i32),
-            LogicOp: Default::default(),
-            RenderTargetWriteMask: b.write_mask,
-        };
-        let mut formats = [DXGI_FORMAT(0); 8];
-        for (f, &t) in formats.iter_mut().zip(desc.targets) {
-            *f = DXGI_FORMAT(t as i32);
-        }
-        let r = desc.raster;
-        // SAFETY: a serialized root signature (or a DXIL container with
-        // one), DXIL stages and descriptions D3D12 validates; the name
-        // strings outlive the call.
-        unsafe {
-            let root: ID3D12RootSignature = self.0.CreateRootSignature(0, blob)?;
-            let pso = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(&root))),
-                VS: dxil(shader.code)?,
-                PS: match desc.pixel {
-                    Some(p) => dxil(p.code)?,
-                    None => D3D12_SHADER_BYTECODE::default(),
-                },
-                BlendState: D3D12_BLEND_DESC {
-                    AlphaToCoverageEnable: false.into(),
-                    IndependentBlendEnable: true.into(),
-                    RenderTarget: desc.blend.map(|b| blend(&b)),
-                },
-                SampleMask: u32::MAX,
-                RasterizerState: D3D12_RASTERIZER_DESC {
-                    FillMode: D3D12_FILL_MODE(r.fill as i32),
-                    CullMode: D3D12_CULL_MODE(r.cull as i32),
-                    FrontCounterClockwise: r.front_ccw.into(),
-                    DepthBias: r.depth_bias,
-                    DepthBiasClamp: r.depth_bias_clamp,
-                    SlopeScaledDepthBias: r.slope_scaled_depth_bias,
-                    DepthClipEnable: r.depth_clip.into(),
-                    ..Default::default()
-                },
-                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
-                    DepthEnable: desc.depth.enable.into(),
-                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK(i32::from(desc.depth.write)),
-                    DepthFunc: D3D12_COMPARISON_FUNC(desc.depth.func as i32),
-                    ..Default::default()
-                },
-                InputLayout: D3D12_INPUT_LAYOUT_DESC {
-                    pInputElementDescs: elements.as_ptr(),
-                    NumElements: elements.len() as u32,
-                },
-                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(desc.topology as i32),
-                NumRenderTargets: desc.targets.len().min(8) as u32,
-                RTVFormats: formats,
-                DSVFormat: DXGI_FORMAT(desc.depth_format as i32),
-                SampleDesc: DXGI_SAMPLE_DESC { Count: desc.samples.max(1), Quality: 0 },
-                ..Default::default()
-            };
-            let state: ID3D12PipelineState = self.0.CreateGraphicsPipelineState(&pso)?;
-            Ok(D3d12Pipeline { root, state, parameters })
-        }
+        graphics::pipeline(self.0, desc)
     }
 
     fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [Footprint]) -> u64 {
@@ -923,5 +815,346 @@ impl Device for D3d12<'_> {
     unsafe fn copy_descriptors(&self, count: u32, to: usize, from: usize, kind: Descriptors) {
         // SAFETY: the caller's ranges.
         unsafe { self.0.CopyDescriptorsSimple(count, handle(to), handle(from), descriptor_type(kind)) }
+    }
+}
+
+/// Graphics pipelines on D3D12, from the seam's description.
+mod graphics {
+    use std::ffi::CString;
+
+    use victory_host::{Blend, Geometry, GraphicsDesc, ShaderCode, StencilFace};
+    use windows::Win32::Foundation::E_INVALIDARG;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+    use windows::core::Interface;
+
+    use super::D3d12Pipeline;
+
+    fn invalid() -> windows::core::Error {
+        windows::core::Error::from_hresult(E_INVALIDARG)
+    }
+
+    fn bytecode(code: Option<ShaderCode<'_>>) -> windows::core::Result<D3D12_SHADER_BYTECODE> {
+        match code {
+            None => Ok(D3D12_SHADER_BYTECODE::default()),
+            Some(ShaderCode::Dxil(d)) => Ok(D3D12_SHADER_BYTECODE {
+                pShaderBytecode: d.as_ptr().cast(),
+                BytecodeLength: d.len(),
+            }),
+            Some(_) => Err(invalid()),
+        }
+    }
+
+    fn blend(b: &Blend) -> D3D12_RENDER_TARGET_BLEND_DESC {
+        D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: b.enable.into(),
+            LogicOpEnable: b.logic_op.is_some().into(),
+            SrcBlend: D3D12_BLEND(b.src as i32),
+            DestBlend: D3D12_BLEND(b.dst as i32),
+            BlendOp: D3D12_BLEND_OP(b.op as i32),
+            SrcBlendAlpha: D3D12_BLEND(b.src_alpha as i32),
+            DestBlendAlpha: D3D12_BLEND(b.dst_alpha as i32),
+            BlendOpAlpha: D3D12_BLEND_OP(b.op_alpha as i32),
+            LogicOp: D3D12_LOGIC_OP(b.logic_op.unwrap_or(D3D12_LOGIC_OP_NOOP.0 as u32) as i32),
+            RenderTargetWriteMask: b.write_mask,
+        }
+    }
+
+    fn face(f: &StencilFace) -> D3D12_DEPTH_STENCILOP_DESC {
+        D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: D3D12_STENCIL_OP(f.fail as i32),
+            StencilDepthFailOp: D3D12_STENCIL_OP(f.depth_fail as i32),
+            StencilPassOp: D3D12_STENCIL_OP(f.pass as i32),
+            StencilFunc: D3D12_COMPARISON_FUNC(f.func as i32),
+        }
+    }
+
+    /// A stream subobject: its type, then its description, pointer-aligned.
+    #[repr(C, align(8))]
+    struct Sub<T>(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, T);
+
+    fn stream<S>(
+        device: &ID3D12Device,
+        stream: &mut S,
+        name: Option<&str>,
+    ) -> windows::core::Result<ID3D12PipelineState> {
+        let desc = D3D12_PIPELINE_STATE_STREAM_DESC {
+            SizeInBytes: size_of::<S>(),
+            pPipelineStateSubobjectStream: std::ptr::from_mut(stream).cast(),
+        };
+        let device = device.cast::<ID3D12Device2>()?;
+        // SAFETY: the stream holds whole subobjects pointing at live data.
+        let create = || unsafe { device.CreatePipelineState(&desc) };
+        match name {
+            // SAFETY: as above.
+            Some(name) => crate::pipeline::library::pipeline(
+                name,
+                |library, name| unsafe { library.LoadPipeline(name, &desc) },
+                create,
+            ),
+            None => create(),
+        }
+    }
+
+    pub(super) fn pipeline(
+        device: &ID3D12Device,
+        desc: &GraphicsDesc<'_>,
+    ) -> windows::core::Result<D3d12Pipeline> {
+        let first = match desc.geometry {
+            Geometry::Vertex { shader, .. } | Geometry::Mesh { shader, .. } => shader,
+        };
+        let ShaderCode::Dxil(first_code) = first.code else {
+            return Err(invalid());
+        };
+        // No root signature given: the one embedded in the first stage.
+        let blob = if desc.root_signature.is_empty() {
+            first_code
+        } else {
+            desc.root_signature
+        };
+        let parameters = victory_host::root::parse(blob)
+            .map_err(|_| invalid())?
+            .parameters
+            .into_iter()
+            .map(|p| p.kind)
+            .collect();
+        // SAFETY: a serialized root signature; D3D12 validates it.
+        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, blob) }?;
+        let mut formats = [DXGI_FORMAT(0); 8];
+        for (f, &t) in formats.iter_mut().zip(desc.targets) {
+            *f = DXGI_FORMAT(t as i32);
+        }
+        let targets = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: formats,
+            NumRenderTargets: desc.targets.len().min(8) as u32,
+        };
+        let blend_state = D3D12_BLEND_DESC {
+            AlphaToCoverageEnable: desc.alpha_to_coverage.into(),
+            IndependentBlendEnable: desc.independent_blend.into(),
+            RenderTarget: desc.blend.map(|b| blend(&b)),
+        };
+        let r = desc.raster;
+        let raster = D3D12_RASTERIZER_DESC {
+            FillMode: D3D12_FILL_MODE(r.fill as i32),
+            CullMode: D3D12_CULL_MODE(r.cull as i32),
+            FrontCounterClockwise: r.front_ccw.into(),
+            DepthBias: r.depth_bias,
+            DepthBiasClamp: r.depth_bias_clamp,
+            SlopeScaledDepthBias: r.slope_scaled_depth_bias,
+            DepthClipEnable: r.depth_clip.into(),
+            MultisampleEnable: r.multisample.into(),
+            AntialiasedLineEnable: r.antialiased_lines.into(),
+            ForcedSampleCount: r.forced_samples,
+            ConservativeRaster: D3D12_CONSERVATIVE_RASTERIZATION_MODE(i32::from(r.conservative)),
+        };
+        let s = desc.stencil;
+        let depth = D3D12_DEPTH_STENCIL_DESC {
+            DepthEnable: desc.depth.enable.into(),
+            DepthWriteMask: D3D12_DEPTH_WRITE_MASK(i32::from(desc.depth.write)),
+            DepthFunc: D3D12_COMPARISON_FUNC(desc.depth.func as i32),
+            StencilEnable: s.enable.into(),
+            StencilReadMask: s.read_mask,
+            StencilWriteMask: s.write_mask,
+            FrontFace: face(&s.front),
+            BackFace: face(&s.back),
+        };
+        let depth1 = D3D12_DEPTH_STENCIL_DESC1 {
+            DepthEnable: depth.DepthEnable,
+            DepthWriteMask: depth.DepthWriteMask,
+            DepthFunc: depth.DepthFunc,
+            StencilEnable: depth.StencilEnable,
+            StencilReadMask: depth.StencilReadMask,
+            StencilWriteMask: depth.StencilWriteMask,
+            FrontFace: depth.FrontFace,
+            BackFace: depth.BackFace,
+            DepthBoundsTestEnable: true.into(),
+        };
+        let samples = DXGI_SAMPLE_DESC {
+            Count: desc.samples.max(1),
+            Quality: desc.sample_quality,
+        };
+        let dsv = DXGI_FORMAT(desc.depth_format as i32);
+        let ps = bytecode(desc.pixel.map(|p| p.code))?;
+        let state = match desc.geometry {
+            Geometry::Mesh {
+                amplification,
+                shader,
+            } => {
+                if amplification.is_some() {
+                    // Not made by victory-gpu yet: no stream for it.
+                    return Err(windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_NOTIMPL,
+                    ));
+                }
+                let ms = bytecode(Some(shader.code))?;
+                // The stream names a triangle topology (see victory-gpu's
+                // pipeline/host.rs: the library refuses to load without).
+                #[repr(C)]
+                struct Stream<D> {
+                    root: Sub<*mut std::ffi::c_void>,
+                    ms: Sub<D3D12_SHADER_BYTECODE>,
+                    ps: Sub<D3D12_SHADER_BYTECODE>,
+                    blend: Sub<D3D12_BLEND_DESC>,
+                    mask: Sub<u32>,
+                    raster: Sub<D3D12_RASTERIZER_DESC>,
+                    depth: Sub<D>,
+                    targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+                    dsv: Sub<DXGI_FORMAT>,
+                    samples: Sub<DXGI_SAMPLE_DESC>,
+                    topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+                }
+                macro_rules! mesh {
+                    ($kind:expr, $depth:expr) => {
+                        stream(
+                            device,
+                            &mut Stream {
+                                root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                                ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
+                                ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+                                blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend_state),
+                                mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, desc.sample_mask),
+                                raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, raster),
+                                depth: Sub($kind, $depth),
+                                targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
+                                dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv),
+                                samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, samples),
+                                topology: Sub(
+                                    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
+                                    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                                ),
+                            },
+                            desc.cache,
+                        )
+                    };
+                }
+                if desc.depth_bounds {
+                    mesh!(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth1)?
+                } else {
+                    mesh!(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, depth)?
+                }
+            }
+            Geometry::Vertex { shader, inputs } => {
+                let vs = bytecode(Some(shader.code))?;
+                let gs = bytecode(desc.geometry_shader.map(|g| g.code))?;
+                let names: Vec<CString> = inputs
+                    .iter()
+                    .map(|e| CString::new(e.semantic).map_err(|_| invalid()))
+                    .collect::<Result<_, _>>()?;
+                let elements: Vec<D3D12_INPUT_ELEMENT_DESC> = inputs
+                    .iter()
+                    .zip(&names)
+                    .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                        SemanticName: windows::core::PCSTR(name.as_ptr().cast()),
+                        SemanticIndex: e.index,
+                        Format: DXGI_FORMAT(e.format as i32),
+                        InputSlot: e.slot,
+                        AlignedByteOffset: e.offset,
+                        InputSlotClass: if e.per_instance {
+                            D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                        } else {
+                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                        },
+                        InstanceDataStepRate: e.step_rate,
+                    })
+                    .collect();
+                let input = D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: if elements.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        elements.as_ptr()
+                    },
+                    NumElements: elements.len() as u32,
+                };
+                let strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(desc.strip_cut as i32);
+                let topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(desc.topology as i32);
+                if desc.depth_bounds {
+                    #[repr(C)]
+                    struct Stream {
+                        root: Sub<*mut std::ffi::c_void>,
+                        vs: Sub<D3D12_SHADER_BYTECODE>,
+                        ps: Sub<D3D12_SHADER_BYTECODE>,
+                        blend: Sub<D3D12_BLEND_DESC>,
+                        mask: Sub<u32>,
+                        raster: Sub<D3D12_RASTERIZER_DESC>,
+                        depth: Sub<D3D12_DEPTH_STENCIL_DESC1>,
+                        input: Sub<D3D12_INPUT_LAYOUT_DESC>,
+                        strip_cut: Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>,
+                        topology: Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>,
+                        targets: Sub<D3D12_RT_FORMAT_ARRAY>,
+                        dsv: Sub<DXGI_FORMAT>,
+                        samples: Sub<DXGI_SAMPLE_DESC>,
+                    }
+                    #[repr(C)]
+                    struct StreamGs {
+                        base: Stream,
+                        gs: Sub<D3D12_SHADER_BYTECODE>,
+                    }
+                    let base = Stream {
+                        root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
+                        vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, vs),
+                        ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
+                        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend_state),
+                        mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, desc.sample_mask),
+                        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, raster),
+                        depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth1),
+                        input: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, input),
+                        strip_cut: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE, strip_cut),
+                        topology: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, topology),
+                        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, targets),
+                        dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, dsv),
+                        samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, samples),
+                    };
+                    if gs.pShaderBytecode.is_null() {
+                        stream(device, &mut { base }, desc.cache)?
+                    } else {
+                        stream(
+                            device,
+                            &mut StreamGs {
+                                base,
+                                gs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, gs),
+                            },
+                            desc.cache,
+                        )?
+                    }
+                } else {
+                    let pso = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                        // SAFETY: a borrowed pointer the description never
+                        // releases.
+                        pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+                        VS: vs,
+                        PS: ps,
+                        GS: gs,
+                        BlendState: blend_state,
+                        SampleMask: desc.sample_mask,
+                        RasterizerState: raster,
+                        DepthStencilState: depth,
+                        InputLayout: input,
+                        IBStripCutValue: strip_cut,
+                        PrimitiveTopologyType: topology,
+                        NumRenderTargets: targets.NumRenderTargets,
+                        RTVFormats: targets.RTFormats,
+                        DSVFormat: dsv,
+                        SampleDesc: samples,
+                        ..Default::default()
+                    };
+                    // SAFETY: the description points at live data.
+                    let create = || unsafe { device.CreateGraphicsPipelineState(&pso) };
+                    match desc.cache {
+                        Some(name) => crate::pipeline::library::pipeline(
+                            name,
+                            // SAFETY: as above.
+                            |library, name| unsafe { library.LoadGraphicsPipeline(name, &pso) },
+                            create,
+                        )?,
+                        None => create()?,
+                    }
+                }
+            }
+        };
+        Ok(D3d12Pipeline {
+            root,
+            state,
+            parameters,
+        })
     }
 }

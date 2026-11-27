@@ -1351,6 +1351,8 @@ mod tests {
                 max_depth: 1.0,
             },
             scissor: None,
+            stencil_ref: 0,
+            blend_factor: [0.0; 4],
         }
     }
 
@@ -1420,6 +1422,15 @@ mod tests {
                     ..Raster::DEFAULT
                 },
                 depth: DepthTest::OFF,
+                sample_quality: 0,
+                sample_mask: u32::MAX,
+                strip_cut: 0,
+                independent_blend: false,
+                alpha_to_coverage: false,
+                stencil: victory_host::Stencil::OFF,
+                depth_bounds: false,
+                geometry_shader: None,
+                cache: None,
             })
             .expect("Metal Shader Converter converts both stages");
         let f = |v: f32| v.to_bits();
@@ -1535,6 +1546,15 @@ mod tests {
                     ..Raster::DEFAULT
                 },
                 depth: DepthTest::OFF,
+                sample_quality: 0,
+                sample_mask: u32::MAX,
+                strip_cut: 0,
+                independent_blend: false,
+                alpha_to_coverage: false,
+                stencil: victory_host::Stencil::OFF,
+                depth_bounds: false,
+                geometry_shader: None,
+                cache: None,
             })
             .expect("Metal Shader Converter converts both stages");
         assert!(matches!(

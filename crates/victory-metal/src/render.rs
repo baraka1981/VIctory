@@ -15,11 +15,13 @@ use objc2_metal::{
     MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice, MTLFunction,
     MTLMeshRenderPipelineDescriptor, MTLPipelineOption, MTLPixelFormat, MTLPrimitiveTopologyClass,
     MTLRenderPipelineColorAttachmentDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState, MTLRenderStages, MTLVertexDescriptor, MTLVertexFormat,
-    MTLVertexStepFunction,
+    MTLRenderPipelineState, MTLRenderStages, MTLStencilDescriptor, MTLStencilOperation,
+    MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
 use saxaboom::ffi::IRShaderStage;
-use victory_host::{Blend, DepthTest, Geometry, GraphicsDesc, Raster, ShaderCode, Stage};
+use victory_host::{
+    Blend, DepthTest, Geometry, GraphicsDesc, Raster, ShaderCode, Stage, Stencil, StencilFace,
+};
 
 use crate::MetalError;
 use crate::device::{MetalDevice, StaticSamplers, c_entry, converted_entry, root_signature_for};
@@ -166,9 +168,23 @@ fn has_stencil(f: MTLPixelFormat) -> bool {
         || f == MTLPixelFormat::X32_Stencil8
 }
 
+fn stencil_op(d3d12: u32) -> MTLStencilOperation {
+    match d3d12 {
+        2 => MTLStencilOperation::Zero,
+        3 => MTLStencilOperation::Replace,
+        4 => MTLStencilOperation::IncrementClamp,
+        5 => MTLStencilOperation::DecrementClamp,
+        6 => MTLStencilOperation::Invert,
+        7 => MTLStencilOperation::IncrementWrap,
+        8 => MTLStencilOperation::DecrementWrap,
+        _ => MTLStencilOperation::Keep,
+    }
+}
+
 fn depth_state(
     device: &ProtocolObject<dyn MTLDevice>,
     d: &DepthTest,
+    stencil: &Stencil,
 ) -> Result<Retained<ProtocolObject<dyn MTLDepthStencilState>>, MetalError> {
     let s = MTLDepthStencilDescriptor::new();
     s.setDepthCompareFunction(if d.enable {
@@ -177,6 +193,20 @@ fn depth_state(
         MTLCompareFunction::Always
     });
     s.setDepthWriteEnabled(d.enable && d.write);
+    if stencil.enable {
+        let face = |f: &StencilFace| {
+            let m = MTLStencilDescriptor::new();
+            m.setStencilCompareFunction(compare(f.func));
+            m.setStencilFailureOperation(stencil_op(f.fail));
+            m.setDepthFailureOperation(stencil_op(f.depth_fail));
+            m.setDepthStencilPassOperation(stencil_op(f.pass));
+            m.setReadMask(u32::from(stencil.read_mask));
+            m.setWriteMask(u32::from(stencil.write_mask));
+            m
+        };
+        s.setFrontFaceStencil(Some(&face(&stencil.front)));
+        s.setBackFaceStencil(Some(&face(&stencil.back)));
+    }
     device
         .newDepthStencilStateWithDescriptor(&s)
         .ok_or(MetalError::Failed("a depth-stencil state"))
@@ -251,6 +281,32 @@ fn vertex_descriptor(
     Ok(d)
 }
 
+/// Warns, once each, about state Metal has no counterpart for.
+fn unsupported(desc: &GraphicsDesc<'_>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGIC: AtomicBool = AtomicBool::new(false);
+    static BOUNDS: AtomicBool = AtomicBool::new(false);
+    static MASK: AtomicBool = AtomicBool::new(false);
+    static CONSERVATIVE: AtomicBool = AtomicBool::new(false);
+    let once = |seen: &AtomicBool, what: &str| {
+        if !seen.swap(true, Ordering::Relaxed) {
+            tracing::warn!("Metal has no {what}: ignored (logged once)");
+        }
+    };
+    if desc.blend.iter().any(|b| b.logic_op.is_some()) {
+        once(&LOGIC, "blend logic ops");
+    }
+    if desc.depth_bounds {
+        once(&BOUNDS, "depth bounds test");
+    }
+    if desc.sample_mask != u32::MAX {
+        once(&MASK, "pipeline sample mask");
+    }
+    if desc.raster.conservative {
+        once(&CONSERVATIVE, "conservative rasterization");
+    }
+}
+
 pub(crate) fn pipeline(
     dev: &MetalDevice,
     desc: &GraphicsDesc<'_>,
@@ -260,6 +316,20 @@ pub(crate) fn pipeline(
     };
     let first = match &desc.geometry {
         Geometry::Vertex { shader, .. } | Geometry::Mesh { shader, .. } => shader,
+    };
+    if desc.geometry_shader.is_some() {
+        // MSC converts geometry shaders only to emulation needing its
+        // runtime's draw path; not done.
+        return Err(MetalError::Shader(
+            "geometry shaders are not supported on Metal yet".into(),
+        ));
+    }
+    unsupported(desc);
+    // Without independent blending every target blends as the first.
+    let blend: [Blend; 8] = if desc.independent_blend {
+        desc.blend
+    } else {
+        [desc.blend[0]; 8]
     };
     let (rs, _) = root_signature_for(desc.root_signature, dxil(first)?)?;
     let top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
@@ -300,7 +370,7 @@ pub(crate) fn pipeline(
                 let layout = vertex_descriptor(inputs, &v, &vertex_fn)?;
                 d.setVertexDescriptor(Some(&layout));
             }
-            for (i, (f, b)) in targets.iter().zip(&desc.blend).enumerate() {
+            for (i, (f, b)) in targets.iter().zip(&blend).enumerate() {
                 // SAFETY: at most 8 targets (GraphicsDesc::blend's length).
                 let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
                 set_blend(&a, *f, b);
@@ -308,6 +378,7 @@ pub(crate) fn pipeline(
             d.setDepthAttachmentPixelFormat(depth_format);
             d.setStencilAttachmentPixelFormat(stencil_format);
             d.setRasterSampleCount(samples);
+            d.setAlphaToCoverageEnabled(desc.alpha_to_coverage);
             let class = match desc.topology {
                 1 => MTLPrimitiveTopologyClass::Point,
                 2 => MTLPrimitiveTopologyClass::Line,
@@ -346,10 +417,11 @@ pub(crate) fn pipeline(
                 d.setFragmentFunction(fragment_fn.as_deref());
                 d.setRasterSampleCount(samples);
             }
+            d.setAlphaToCoverageEnabled(desc.alpha_to_coverage);
             if let Some(a) = &a {
                 d.setPayloadMemoryLength(a.payload as usize);
             }
-            for (i, (f, b)) in targets.iter().zip(&desc.blend).enumerate() {
+            for (i, (f, b)) in targets.iter().zip(&blend).enumerate() {
                 // SAFETY: as above.
                 let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
                 set_blend(&a, *f, b);
@@ -384,7 +456,7 @@ pub(crate) fn pipeline(
     }
     Ok(MetalGraphicsPipeline {
         state,
-        depth: depth_state(device, &desc.depth)?,
+        depth: depth_state(device, &desc.depth, &desc.stencil)?,
         raster: desc.raster,
         top,
         kind,

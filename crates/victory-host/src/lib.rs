@@ -400,6 +400,8 @@ pub struct Blend {
     pub op_alpha: u32,
     /// D3D12's bits: red 1, green 2, blue 4, alpha 8.
     pub write_mask: u8,
+    /// A logic op (`D3D12_LOGIC_OP`) instead of blending, if any.
+    pub logic_op: Option<u32>,
 }
 
 impl Blend {
@@ -413,6 +415,7 @@ impl Blend {
         dst_alpha: 1,
         op_alpha: 1,
         write_mask: 0xf,
+        logic_op: None,
     };
 }
 
@@ -429,6 +432,10 @@ pub struct Raster {
     pub depth_bias_clamp: f32,
     pub slope_scaled_depth_bias: f32,
     pub depth_clip: bool,
+    pub multisample: bool,
+    pub antialiased_lines: bool,
+    pub forced_samples: u32,
+    pub conservative: bool,
 }
 
 impl Raster {
@@ -441,10 +448,14 @@ impl Raster {
         depth_bias_clamp: 0.0,
         slope_scaled_depth_bias: 0.0,
         depth_clip: true,
+        multisample: false,
+        antialiased_lines: false,
+        forced_samples: 0,
+        conservative: false,
     };
 }
 
-/// Depth testing (stencil: later).
+/// Depth testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DepthTest {
     pub enable: bool,
@@ -461,6 +472,45 @@ impl DepthTest {
     };
 }
 
+/// What one face does with stencil (`D3D12_DEPTH_STENCILOP_DESC`):
+/// `D3D12_STENCIL_OP` numbers (1 keep .. 8 decrement) and the comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StencilFace {
+    pub fail: u32,
+    pub depth_fail: u32,
+    pub pass: u32,
+    pub func: u32,
+}
+
+impl StencilFace {
+    pub const KEEP: StencilFace = StencilFace {
+        fail: 1,
+        depth_fail: 1,
+        pass: 1,
+        func: 8,
+    };
+}
+
+/// Stencil testing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stencil {
+    pub enable: bool,
+    pub read_mask: u8,
+    pub write_mask: u8,
+    pub front: StencilFace,
+    pub back: StencilFace,
+}
+
+impl Stencil {
+    pub const OFF: Stencil = Stencil {
+        enable: false,
+        read_mask: 0xff,
+        write_mask: 0xff,
+        front: StencilFace::KEEP,
+        back: StencilFace::KEEP,
+    };
+}
+
 /// A graphics pipeline. Root signature as for [`ComputeDesc`] (empty:
 /// the one embedded in the vertex or mesh shader); its arguments at draw
 /// time go the same way.
@@ -474,12 +524,28 @@ pub struct GraphicsDesc<'a> {
     /// Depth-stencil format, 0 for none.
     pub depth_format: u32,
     pub samples: u32,
+    pub sample_quality: u32,
+    /// Which samples are written.
+    pub sample_mask: u32,
     /// `D3D12_PRIMITIVE_TOPOLOGY_TYPE`: 1 point, 2 line, 3 triangle.
     pub topology: u32,
-    /// One per target (the rest ignored).
+    /// `D3D12_INDEX_BUFFER_STRIP_CUT_VALUE`: 0 none, 1 0xffff,
+    /// 2 0xffffffff.
+    pub strip_cut: u32,
+    /// Blending per target; with `independent_blend` false every target
+    /// blends as `blend[0]` (D3D12's `IndependentBlendEnable`).
     pub blend: [Blend; 8],
+    pub independent_blend: bool,
+    pub alpha_to_coverage: bool,
     pub raster: Raster,
     pub depth: DepthTest,
+    pub stencil: Stencil,
+    /// The depth bounds test (bounds set at draw time).
+    pub depth_bounds: bool,
+    /// A geometry shader after the vertex shader (vertex geometry only).
+    pub geometry_shader: Option<Stage<'a>>,
+    /// As [`ComputeDesc::cache`].
+    pub cache: Option<&'a str>,
 }
 
 /// A dispatch's or draw's arguments: what the root signature takes
@@ -556,6 +622,10 @@ pub struct Pass<'a> {
     pub viewport: Viewport,
     /// left, top, right, bottom; the viewport's bounds when `None`.
     pub scissor: Option<[u32; 4]>,
+    /// The stencil reference value.
+    pub stencil_ref: u32,
+    /// The constant blend factor (`D3D12_BLEND_BLEND_FACTOR`).
+    pub blend_factor: [f32; 4],
 }
 
 /// A vertex buffer for one slot.

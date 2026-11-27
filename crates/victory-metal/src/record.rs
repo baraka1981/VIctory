@@ -223,6 +223,9 @@ impl MetalRecorder {
     ) {
         enc.setRenderPipelineState(&pipeline.state);
         enc.setDepthStencilState(Some(&pipeline.depth));
+        enc.setStencilReferenceValue(pass.stencil_ref);
+        let [red, green, blue, alpha] = pass.blend_factor;
+        enc.setBlendColorRed_green_blue_alpha(red, green, blue, alpha);
         let r = &pipeline.raster;
         enc.setCullMode(match r.cull {
             2 => MTLCullMode::Front,
