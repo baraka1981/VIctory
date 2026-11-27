@@ -8,9 +8,11 @@
 //! shader with its root signature inside), leaving the title's argument and
 //! count buffers untouched.
 //!
-//! When a count buffer is given, threads at or past `min(max, count)` return
-//! immediately without charging the list's budget or reading uninitialized
-//! tail slots. Each list has a budget (2^27 vertex instances or threads,
+//! When a count buffer is given, threads at or past `min(max, count)` write
+//! an empty record (zero counts or groups) and return, without charging the
+//! list's budget or reading uninitialized tail slots: D3D12 never reads
+//! those records, and a backend that runs every record it is given (Metal,
+//! which reads no count while recording) runs them empty. Each list has a budget (2^27 vertex instances or threads,
 //! groups counted as 64 threads, mesh groups as 128): active records past it
 //! run empty, saturating without 32-bit wraparound so a list of thousands of
 //! garbage records cannot run for seconds either.
@@ -60,7 +62,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    if (id.x >= eff_count) {
+        // Past the count: an empty record, for a host that runs all the
+        // records it was given (Metal reads no count while recording).
+        if (!split) {
+            dst_args.Store3(id.x * stride, uint3(0, 0, 0));
+        }
+        return;
+    }
     uint src_at = args_offset + id.x * stride;
     uint dst_at = id.x * stride;
     uint cost;

@@ -752,6 +752,17 @@ pub struct IndexView {
 /// A rectangle (`D3D12_RECT`): left, top, right, bottom.
 pub type Rect = [i32; 4];
 
+/// Kinds of indirect argument (`D3D12_INDIRECT_ARGUMENT_TYPE`) for
+/// [`Recorder::execute_indirect`]; records are laid out as D3D12's
+/// (`D3D12_DRAW_ARGUMENTS`, `D3D12_DRAW_INDEXED_ARGUMENTS`,
+/// `D3D12_DISPATCH_ARGUMENTS`, `D3D12_DISPATCH_MESH_ARGUMENTS`).
+pub mod indirect {
+    pub const DRAW: u32 = 0;
+    pub const INDEXED: u32 = 1;
+    pub const DISPATCH: u32 = 2;
+    pub const MESH: u32 = 10;
+}
+
 /// Recording into one open command list (slice 2a: barriers and copies).
 /// Methods are unsafe: the caller keeps the list open and every resource
 /// alive until the list has run, and ranges inside their resources.
@@ -955,6 +966,34 @@ pub trait Recorder {
     /// # Safety
     /// As for [`Recorder::draw_instanced`].
     unsafe fn dispatch_mesh_groups(&self, groups: [u32; 3]);
+
+    /// Draws or dispatches with what is set, from `max` records of
+    /// `kind` ([`indirect`]) `stride` bytes apart from `offset` in `args`
+    /// (`ExecuteIndirect` with one argument). With `count`, the 32-bit
+    /// count there bounds them; a backend that cannot read it while
+    /// recording (Metal) runs all `max`, so records past the count must be
+    /// empty (zero counts or groups).
+    ///
+    /// # Safety
+    /// See above; the records (and count) are in live buffers, ready to be
+    /// read as indirect arguments.
+    unsafe fn execute_indirect(
+        &self,
+        kind: u32,
+        stride: u32,
+        max: u32,
+        args: &Self::Resource,
+        offset: u64,
+        count: Option<(&Self::Resource, u64)>,
+    );
+
+    /// Resolves multisampled subresource `src_sub` of `src` into `dst_sub`
+    /// of `dst` (`ResolveSubresource`), as DXGI `format`: the area both
+    /// cover, from their top left (the console clips a larger source).
+    ///
+    /// # Safety
+    /// See the trait; `src` is ready to resolve from, `dst` to resolve to.
+    unsafe fn resolve(&self, dst: &Self::Resource, dst_sub: u32, src: &Self::Resource, src_sub: u32, format: u32);
 
     /// # Safety
     /// See the trait.

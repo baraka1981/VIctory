@@ -1131,12 +1131,6 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
-        use windows::Win32::Foundation::RECT;
-        use windows::Win32::Graphics::Direct3D12::{
-            D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
-        };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
-        use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
         if unlike(dst, src) {
@@ -1150,33 +1144,11 @@ extern "system" fn resolve(
         crate::texture::host_written(dst);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
-        // SAFETY: an open list and live textures; the region is inside both.
+        use victory_host::Recorder as _;
+        // SAFETY: an open list and live textures in their resolve states.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
-            if (a.Width, a.Height) == (b.Width, b.Height) {
-                list.list
-                    .ResolveSubresource(to, dst_sub, from, src_sub, format);
-            } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
-                // The console clips a larger source to the destination.
-                let rect = RECT {
-                    left: 0,
-                    top: 0,
-                    right: a.Width.min(b.Width) as i32,
-                    bottom: a.Height.min(b.Height) as i32,
-                };
-                list1.ResolveSubresourceRegion(
-                    to,
-                    dst_sub,
-                    0,
-                    0,
-                    from,
-                    src_sub,
-                    Some(&rect),
-                    format,
-                    D3D12_RESOLVE_MODE_AVERAGE,
-                );
-            }
+            let format = if crate::resource::stands_in(dst) { to.GetDesc().Format.0 as u32 } else { format };
+            crate::backend::rec(&list.list).resolve(to, dst_sub, from, src_sub, format);
         }
     }
     #[cfg(not(windows))]

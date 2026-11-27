@@ -1810,6 +1810,204 @@ mod tests {
         }
     }
 
+    /// Indirect dispatch through the seam: one record of 4 groups, then an
+    /// empty one (what the clamp leaves past a count). Same result as the
+    /// direct dispatch. Needs Metal Shader Converter and add.dxil.
+    #[test]
+    fn indirect_dispatch_runs_its_records() {
+        use victory_host::{ComputeDesc, Point, Recorder as _, ShaderCode};
+        let Some(dxil) = fixture("add.dxil") else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &[],
+                threads: [0; 3],
+                cache: None,
+            })
+            .expect("Metal Shader Converter converts the shader");
+        let input = upload(&gpu, &(0..256).collect::<Vec<u32>>());
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(256 * 4, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        // Two D3D12_DISPATCH_ARGUMENTS records, 16 bytes apart.
+        let args = upload(&gpu, &[4, 1, 1, 0, 0, 0, 0, 0]);
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.set_compute_root(&pipeline);
+            rec.set_compute_pipeline(&pipeline);
+            rec.set_root_constants(Point::Compute, 0, 0, &[1000]);
+            rec.set_root_view(Point::Compute, 1, victory_host::root::parameter::SRV, gpu.gpu_address(&input));
+            rec.set_root_view(Point::Compute, 2, victory_host::root::parameter::UAV, gpu.gpu_address(&out));
+            rec.execute_indirect(victory_host::indirect::DISPATCH, 16, 2, &args, 0, None);
+        }
+        rec.commit_and_wait().expect("the dispatch runs");
+        let MetalResource::Buffer(o) = &out else {
+            unreachable!()
+        };
+        let got = o.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            assert_eq!(unsafe { got.add(n).read() }, n as u32 * 2 + 1000, "element {n}");
+        }
+    }
+
+    /// Indirect draws through the seam, set state first as victory-gpu
+    /// records: the left half red from a non-indexed record, the right half
+    /// green from an indexed one, one render encoder. Needs Metal Shader
+    /// Converter and quad_vs.dxil / quad_ps.dxil.
+    #[test]
+    fn indirect_draws_run_their_records() {
+        use victory_host::{
+            APPEND_ALIGNED, Blend, DepthTest, Geometry, GraphicsDesc, IndexView, InputElement,
+            Point, Raster, Recorder as _, ShaderCode, Stage, VertexView, Viewport, indirect,
+        };
+        let (Some(vs), Some(ps)) = (fixture("quad_vs.dxil"), fixture("quad_ps.dxil")) else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let inputs = [InputElement {
+            semantic: "POSITION",
+            index: 0,
+            format: 16,
+            slot: 0,
+            offset: APPEND_ALIGNED,
+            per_instance: false,
+            step_rate: 0,
+        }];
+        let pipeline = gpu
+            .graphics_pipeline(&GraphicsDesc {
+                geometry: Geometry::Vertex {
+                    shader: Stage {
+                        code: ShaderCode::Dxil(&vs),
+                        entry: "main",
+                    },
+                    inputs: &inputs,
+                },
+                pixel: Some(Stage {
+                    code: ShaderCode::Dxil(&ps),
+                    entry: "main",
+                }),
+                root_signature: &[],
+                targets: &[28],
+                depth_format: 0,
+                samples: 1,
+                topology: 3,
+                blend: [Blend::OPAQUE; 8],
+                raster: Raster {
+                    cull: 1,
+                    ..Raster::DEFAULT
+                },
+                depth: DepthTest::OFF,
+                sample_quality: 0,
+                sample_mask: u32::MAX,
+                strip_cut: 0,
+                independent_blend: false,
+                alpha_to_coverage: false,
+                stencil: victory_host::Stencil::OFF,
+                depth_bounds: false,
+                geometry_shader: None,
+                cache: None,
+            })
+            .expect("Metal Shader Converter converts both stages");
+        let f = |v: f32| v.to_bits();
+        let left = upload(
+            &gpu,
+            &[-1.0, -1.0, -1.0, 1.0, 0.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0].map(f),
+        );
+        let right = upload(&gpu, &[0.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0].map(f));
+        let pair = |a: u32, b: u32| a | (b << 16);
+        let indices = upload(&gpu, &[pair(0, 1), pair(2, 2), pair(1, 3)]);
+        // D3D12_DRAW_ARGUMENTS, then D3D12_DRAW_INDEXED_ARGUMENTS at 16.
+        let args = upload(&gpu, &[6, 1, 0, 0, 6, 1, 0, 0, 0]);
+        let red = colour([1.0, 0.0, 0.0, 1.0]);
+        let green = colour([0.0, 1.0, 0.0, 1.0]);
+        let view = |r: &MetalResource, stride| VertexView {
+            address: gpu.gpu_address(r),
+            size: 48,
+            stride,
+        };
+        let pixels = render_8x8(&gpu, |rec, at| unsafe {
+            rec.clear_target(at, [0.0, 0.0, 1.0, 1.0], &[]);
+            rec.set_targets(&[at], None);
+            rec.set_viewports(&[Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 8.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }]);
+            rec.set_scissors(&[[0, 0, 8, 8]]);
+            rec.set_graphics_root(&pipeline);
+            rec.set_graphics_pipeline(&pipeline);
+            rec.set_topology(4);
+            rec.set_root_constants(Point::Graphics, 0, 0, &red);
+            rec.set_vertex_buffers(0, &[view(&left, 8)]);
+            rec.execute_indirect(indirect::DRAW, 16, 1, &args, 0, None);
+            rec.set_root_constants(Point::Graphics, 0, 0, &green);
+            rec.set_vertex_buffers(0, &[view(&right, 8)]);
+            rec.set_index_buffer(Some(IndexView {
+                address: gpu.gpu_address(&indices),
+                size: 12,
+                format: 57,
+            }));
+            rec.execute_indirect(indirect::INDEXED, 20, 1, &args, 16, None);
+        });
+        assert_eq!(pixels[8 + 1], [255, 0, 0, 255], "left half red");
+        assert_eq!(pixels[5 * 8 + 6], [0, 255, 0, 255], "right half green");
+    }
+
+    /// Resolve through the seam: a 4x multisampled 8x8 target cleared to
+    /// one colour, resolved into a single-sample texture, read back.
+    #[test]
+    fn multisampled_target_resolves() {
+        use victory_host::{Location, Recorder as _};
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let msaa = ResourceDesc {
+            mip_levels: 1,
+            sample_count: 4,
+            ..texture(8, 8, 28, flags::RENDER_TARGET)
+        };
+        let one = ResourceDesc {
+            mip_levels: 1,
+            ..texture(8, 8, 28, flags::RENDER_TARGET)
+        };
+        let src = gpu.committed(Memory::Device, &msaa, state::COMMON, None).unwrap();
+        let dst = gpu.committed(Memory::Device, &one, state::COMMON, None).unwrap();
+        let rtvs = gpu.descriptor_heap(Descriptors::Targets, 1, false).unwrap();
+        let at = gpu.descriptor_start(&rtvs);
+        unsafe { gpu.target_view(Some(&src), None, at) };
+        let mut fp = [victory_host::Footprint::default()];
+        let bytes = gpu.copy_layout(&one, 0, &mut fp);
+        let back = gpu
+            .committed(Memory::Readback, &ResourceDesc::buffer(bytes, 0), state::COPY_DEST, None)
+            .unwrap();
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.clear_target(at, [0.0, 1.0, 0.0, 1.0], &[]);
+            rec.resolve(&dst, 0, &src, 0, 28);
+            rec.copy_texture(Location::Footprint(&back, fp[0]), [0, 0, 0], Location::Subresource(&dst, 0), None);
+        }
+        rec.commit_and_wait().expect("the resolve runs");
+        let MetalResource::Buffer(b) = &back else {
+            unreachable!()
+        };
+        let base = b.contents().as_ptr().cast::<u8>();
+        for (x, y) in [(0, 0), (7, 7), (3, 4)] {
+            let p = unsafe { base.add(fp[0].row_pitch as usize * y + x * 4) };
+            let got = unsafe { [p.read(), p.add(1).read(), p.add(2).read(), p.add(3).read()] };
+            assert_eq!(got, [0, 255, 0, 255], "pixel {x},{y}");
+        }
+    }
+
     /// crate::toplevel's offsets against where MSC itself says each
     /// resource goes, for every parameter kind (RS10: constants, root
     /// CBV/SRV/UAV, tables incl. unbounded and samplers, a static sampler;

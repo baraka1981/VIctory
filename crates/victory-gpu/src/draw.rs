@@ -3466,8 +3466,8 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        let Some(_signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+            .then(|| crate::backend::signature(kind, stride))
             .flatten()
         else {
             why("no host signature");
@@ -3486,7 +3486,7 @@ impl State {
         // A dispatch that may have more groups than the host runs in one
         // dimension, by a program that takes the number of its first group.
         let parts = if kind == DISPATCH && max == 1 && count.is_none() {
-            group_base(p).zip(host_signature(DISPATCH, crate::indirect::PART_BYTES as u32))
+            group_base(p).zip(crate::backend::signature(DISPATCH, crate::indirect::PART_BYTES as u32))
         } else {
             None
         };
@@ -3598,21 +3598,22 @@ impl State {
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
-            if let Some(((param, dword), signature)) = &parts {
+            if let Some(((param, dword), _)) = &parts {
+                let part_bytes = crate::indirect::PART_BYTES as u32;
                 for part in 0..crate::indirect::SPLIT {
-                    list.list.SetComputeRoot32BitConstant(*param, part * crate::indirect::PART, *dword);
+                    rec(list).set_root_constants(Point::Compute, *param, *dword, &[part * crate::indirect::PART]);
                     let at = u64::from(part) * crate::indirect::PART_BYTES;
-                    list.list.ExecuteIndirect(signature, 1, &bounded, at, None, 0);
+                    rec(list).execute_indirect(DISPATCH, part_bytes, 1, &bounded, at, None);
                 }
-                list.list.SetComputeRoot32BitConstant(*param, 0, *dword);
+                rec(list).set_root_constants(Point::Compute, *param, *dword, &[0]);
             } else {
-                list.list.ExecuteIndirect(
-                    &signature,
+                rec(list).execute_indirect(
+                    kind,
+                    stride,
                     max,
                     &bounded,
                     at,
-                    counter.as_ref().map(|(s, _)| &s.buffer),
-                    counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                    counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
                 )
             }
         };
@@ -3660,44 +3661,6 @@ fn compute_word(p: &crate::pipeline::host::HostPipeline, kind: u32) -> Option<(u
 
 fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
     std::array::from_fn(|i| threads[i].div_ceil(size[i]))
-}
-
-/// The host command signature for one argument of `kind` with records
-/// `stride` bytes apart (no root arguments, so no root signature), made
-/// once.
-fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
-    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
-        std::sync::Mutex::new(Vec::new());
-    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
-        return Some(s.clone());
-    }
-    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
-        ..Default::default()
-    };
-    let desc = D3D12_COMMAND_SIGNATURE_DESC {
-        ByteStride: stride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &argument,
-        NodeMask: 0,
-    };
-    let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: a description of one argument; no root arguments.
-    let result = unsafe {
-        crate::host::host()?.device.CreateCommandSignature(
-            &desc,
-            None::<&ID3D12RootSignature>,
-            &mut signature,
-        )
-    };
-    if let Err(e) = result {
-        once!(error = %e, kind, stride, "host command signature refused");
-        return None;
-    }
-    let signature = signature?;
-    made.push(((kind, stride), signature.clone()));
-    Some(signature)
 }
 
 /// Gets what a shader reads or writes through a view ready: buffer data

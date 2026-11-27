@@ -580,6 +580,44 @@ impl MetalRecorder {
         }
     }
 
+    /// The bound compute state onto `enc` for a dispatch.
+    fn compute_state(
+        &self,
+        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        st: &State,
+        pso: &ComputePso,
+    ) {
+        enc.setComputePipelineState(&pso.state);
+        let bound = &st.compute;
+        let top = bound.top.fill_args(
+            &bound.args,
+            bound.statics.as_ref().map_or(0, |s| s.gpuAddress()),
+        );
+        // SAFETY: Metal copies the bytes; the heaps' tables are live.
+        unsafe {
+            enc.setBytes_length_atIndex(
+                NonNull::from(&top[0]).cast(),
+                top.len(),
+                crate::irconverter::ARGUMENT_BUFFER_INDEX,
+            );
+            for (heap, index) in [
+                (&st.views, VIEW_HEAP_INDEX),
+                (&st.samplers, SAMPLER_HEAP_INDEX),
+            ] {
+                if let Some(h) = heap {
+                    enc.setBuffer_offset_atIndex(Some(&h.table), 0, index);
+                }
+            }
+        }
+        let residency = self.residency(st, bound);
+        for h in &residency.heaps {
+            enc.useHeap(h);
+        }
+        for (r, writes) in &residency.loose {
+            enc.useResource_usage(r, usage(*writes));
+        }
+    }
+
     /// Clears `at`'s view: a render pass of its own that clears and stores.
     fn clear(
         &self,
@@ -1156,35 +1194,7 @@ impl Recorder for MetalRecorder {
         let st = self.state.borrow();
         let Some(pso) = &st.compute_pso else { return };
         let Some(enc) = self.compute() else { return };
-        enc.setComputePipelineState(&pso.state);
-        let bound = &st.compute;
-        let top = bound.top.fill_args(
-            &bound.args,
-            bound.statics.as_ref().map_or(0, |s| s.gpuAddress()),
-        );
-        // SAFETY: Metal copies the bytes; the heaps' tables are live.
-        unsafe {
-            enc.setBytes_length_atIndex(
-                NonNull::from(&top[0]).cast(),
-                top.len(),
-                crate::irconverter::ARGUMENT_BUFFER_INDEX,
-            );
-            for (heap, index) in [
-                (&st.views, VIEW_HEAP_INDEX),
-                (&st.samplers, SAMPLER_HEAP_INDEX),
-            ] {
-                if let Some(h) = heap {
-                    enc.setBuffer_offset_atIndex(Some(&h.table), 0, index);
-                }
-            }
-        }
-        let residency = self.residency(&st, bound);
-        for h in &residency.heaps {
-            enc.useHeap(h);
-        }
-        for (r, writes) in &residency.loose {
-            enc.useResource_usage(r, usage(*writes));
-        }
+        self.compute_state(&enc, &st, pso);
         enc.dispatchThreadgroups_threadsPerThreadgroup(size3(groups), size3(pso.threads));
     }
 
@@ -1203,6 +1213,177 @@ impl Recorder for MetalRecorder {
             size3(object),
             size3(mesh),
         );
+    }
+
+    /// D3D12's record layouts are Metal's indirect argument layouts
+    /// (`MTLDrawPrimitivesIndirectArguments` and the rest), so each record
+    /// is one Metal indirect command. The count is not read: all `max`
+    /// records run (see the trait). Draw parameters for vertex shaders
+    /// that read them are the record itself (MSC's
+    /// `IRRuntimeDrawArgument` / `IndexedArgument` share the layout).
+    unsafe fn execute_indirect(
+        &self,
+        kind: u32,
+        stride: u32,
+        max: u32,
+        args: &MetalResource,
+        offset: u64,
+        _count: Option<(&MetalResource, u64)>,
+    ) {
+        use victory_host::indirect;
+        let Some(args) = buffer(args) else { return };
+        let at = |i: u32| offset as usize + i as usize * stride as usize;
+        let st = self.state.borrow();
+        if kind == indirect::DISPATCH {
+            let Some(pso) = &st.compute_pso else { return };
+            let Some(enc) = self.compute() else { return };
+            self.compute_state(&enc, &st, pso);
+            for i in 0..max {
+                // SAFETY: the caller's records, inside `args`.
+                unsafe {
+                    enc.dispatchThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerThreadgroup(
+                        args,
+                        at(i),
+                        size3(pso.threads),
+                    )
+                };
+            }
+            return;
+        }
+        let Some(pso) = &st.graphics_pso else { return };
+        let Some((enc, size)) = self.render(&st.targets, st.depth) else {
+            return;
+        };
+        self.render_state(&enc, size, &st, pso);
+        let draw_params = matches!(pso.kind, Kind::Vertex { draw_params: true });
+        let ty = primitive(st.topology);
+        // SAFETY (all below): the caller's records, inside `args`; MSC's
+        // draw parameter buffers as for the direct draws.
+        match kind {
+            indirect::DRAW => {
+                if draw_params {
+                    let none = 0u16;
+                    unsafe {
+                        enc.setVertexBytes_length_atIndex(
+                            NonNull::from(&none).cast(),
+                            2,
+                            crate::irconverter::UNIFORMS_INDEX,
+                        )
+                    };
+                }
+                for i in 0..max {
+                    unsafe {
+                        if draw_params {
+                            enc.setVertexBuffer_offset_atIndex(
+                                Some(args),
+                                at(i),
+                                crate::irconverter::DRAW_ARGUMENTS_INDEX,
+                            );
+                        }
+                        enc.drawPrimitives_indirectBuffer_indirectBufferOffset(ty, args, at(i));
+                    }
+                }
+            }
+            indirect::INDEXED => {
+                let Some(view) = st.index else { return };
+                let Some(ib) = self.buffers.at(view.address) else {
+                    return;
+                };
+                let kind = if view.format == 57 {
+                    MTLIndexType::UInt16
+                } else {
+                    MTLIndexType::UInt32
+                };
+                if draw_params {
+                    let ir = kind.0 as u16 + 1;
+                    unsafe {
+                        enc.setVertexBytes_length_atIndex(
+                            NonNull::from(&ir).cast(),
+                            2,
+                            crate::irconverter::UNIFORMS_INDEX,
+                        )
+                    };
+                }
+                let ib_offset = (view.address - ib.gpuAddress()) as usize;
+                for i in 0..max {
+                    unsafe {
+                        if draw_params {
+                            enc.setVertexBuffer_offset_atIndex(
+                                Some(args),
+                                at(i),
+                                crate::irconverter::DRAW_ARGUMENTS_INDEX,
+                            );
+                        }
+                        enc.drawIndexedPrimitives_indexType_indexBuffer_indexBufferOffset_indirectBuffer_indirectBufferOffset(
+                            ty, kind, &ib, ib_offset, args, at(i),
+                        );
+                    }
+                }
+            }
+            indirect::MESH => {
+                let Kind::Mesh { object, mesh, .. } = pso.kind else {
+                    return;
+                };
+                for i in 0..max {
+                    unsafe {
+                        enc.drawMeshThreadgroupsWithIndirectBuffer_indirectBufferOffset_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+                            args,
+                            at(i),
+                            size3(object),
+                            size3(mesh),
+                        )
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A render pass that loads the multisampled source and stores it
+    /// resolved into the destination. Metal resolves whole attachments of
+    /// one size: a size mismatch is warned about and skipped.
+    unsafe fn resolve(
+        &self,
+        dst: &MetalResource,
+        dst_sub: u32,
+        src: &MetalResource,
+        src_sub: u32,
+        _format: u32,
+    ) {
+        let (Some(to), Some(from)) = (texture(dst), texture(src)) else {
+            return;
+        };
+        let (to_slice, to_level) = place(to, dst_sub);
+        let (from_slice, from_level) = place(from, src_sub);
+        let size = |t: &ProtocolObject<dyn MTLTexture>, l: usize| {
+            ((t.width() >> l).max(1), (t.height() >> l).max(1))
+        };
+        if size(to, to_level) != size(from, from_level) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!("Metal resolve of unlike sizes not done: skipped (logged once)")
+            });
+            return;
+        }
+        self.end();
+        let d = MTLRenderPassDescriptor::new();
+        // SAFETY: attachment 0.
+        let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(0) };
+        a.setTexture(Some(from));
+        a.setLevel(from_level);
+        a.setSlice(from_slice);
+        a.setLoadAction(MTLLoadAction::Load);
+        a.setStoreAction(MTLStoreAction::MultisampleResolve);
+        a.setResolveTexture(Some(to));
+        a.setResolveLevel(to_level);
+        if to.textureType() == MTLTextureType::Type3D {
+            a.setResolveDepthPlane(to_slice);
+        } else {
+            a.setResolveSlice(to_slice);
+        }
+        if let Some(e) = self.buffer.renderCommandEncoderWithDescriptor(&d) {
+            e.endEncoding();
+        }
     }
 
     unsafe fn barriers(&self, barriers: &[Barrier<'_, MetalResource>]) {

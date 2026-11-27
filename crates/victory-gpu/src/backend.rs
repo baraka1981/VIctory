@@ -403,6 +403,43 @@ impl D3d12List<'_> {
     }
 }
 
+/// The command signature for one indirect argument of `kind` with records
+/// `stride` bytes apart (no root arguments, so no root signature), made
+/// once per process.
+pub(crate) fn signature(kind: u32, stride: u32) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12CommandSignature> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC, D3D12_INDIRECT_ARGUMENT_TYPE,
+        ID3D12CommandSignature,
+    };
+    static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == (kind, stride)) {
+        return Some(s.clone());
+    }
+    let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+        Type: D3D12_INDIRECT_ARGUMENT_TYPE(kind as i32),
+        ..Default::default()
+    };
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: stride,
+        NumArgumentDescs: 1,
+        pArgumentDescs: &argument,
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: a description of one argument; no root arguments.
+    let result = unsafe {
+        crate::host::host()?.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+    };
+    if let Err(e) = result {
+        tracing::warn!(error = %e, kind, stride, "host command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push(((kind, stride), signature.clone()));
+    Some(signature)
+}
+
 fn rects_of(rects: &[victory_host::Rect]) -> Vec<windows::Win32::Foundation::RECT> {
     rects
         .iter()
@@ -682,6 +719,40 @@ impl Recorder for D3d12List<'_> {
         if let Ok(l6) = self.0.cast::<windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList6>() {
             // SAFETY: the caller's.
             unsafe { l6.DispatchMesh(groups[0], groups[1], groups[2]) };
+        }
+    }
+
+    unsafe fn execute_indirect(
+        &self,
+        kind: u32,
+        stride: u32,
+        max: u32,
+        args: &ID3D12Resource,
+        offset: u64,
+        count: Option<(&ID3D12Resource, u64)>,
+    ) {
+        let Some(signature) = signature(kind, stride) else { return };
+        // SAFETY: the caller's; the signature is cached for the process.
+        unsafe {
+            self.0.ExecuteIndirect(&signature, max, args, offset, count.map(|(c, _)| c), count.map_or(0, |(_, at)| at))
+        };
+    }
+
+    unsafe fn resolve(&self, dst: &ID3D12Resource, dst_sub: u32, src: &ID3D12Resource, src_sub: u32, format: u32) {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        use windows::core::Interface;
+        let format = DXGI_FORMAT(format as i32);
+        // SAFETY: the caller's live textures in their resolve states.
+        unsafe {
+            let (a, b) = (dst.GetDesc(), src.GetDesc());
+            if (a.Width, a.Height) == (b.Width, b.Height) {
+                self.0.ResolveSubresource(dst, dst_sub, src, src_sub, format);
+            } else if let Ok(list1) = self.0.cast::<ID3D12GraphicsCommandList1>() {
+                let rect = RECT { left: 0, top: 0, right: a.Width.min(b.Width) as i32, bottom: a.Height.min(b.Height) as i32 };
+                list1.ResolveSubresourceRegion(dst, dst_sub, 0, 0, src, src_sub, Some(&rect), format, D3D12_RESOLVE_MODE_AVERAGE);
+            }
         }
     }
 

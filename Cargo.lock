@@ -855,6 +855,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-metal",
  "saxaboom",
+ "tracing",
  "victory-host",
 ]
 
