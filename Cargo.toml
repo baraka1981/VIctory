@@ -23,6 +23,8 @@ victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
 victory-host = { path = "crates/victory-host" }
+victory-metal = { path = "crates/victory-metal" }
+victory-wine = { path = "crates/victory-wine" }
 
 # External crates
 anyhow = "1.0.104"

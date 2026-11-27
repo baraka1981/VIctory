@@ -889,6 +889,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "victory-wine"
+version = "0.1.0"
+dependencies = [
+ "victory-host",
+ "windows-sys",
+]
+
+[[package]]
+name = "victory-wine-dll"
+version = "0.1.0"
+
+[[package]]
+name = "victory-wine-unix"
+version = "0.1.0"
+dependencies = [
+ "objc2",
+ "objc2-metal",
+ "victory-host",
+ "victory-metal",
+ "victory-wine",
+]
+
+[[package]]
 name = "walkdir"
 version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

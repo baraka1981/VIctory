@@ -1,6 +1,7 @@
 //! Repository maintenance. Run with `cargo xtask <command>`.
 
 mod policy;
+mod wine;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,12 +27,21 @@ enum Cmd {
     },
     /// Point git at .githooks/ so every commit runs the policy check.
     InstallHooks,
+    /// Build the Wine bridge (victory_metal.dll + .so) and its smoke test
+    /// into target/wine/ (macOS; needs the x86_64-apple-darwin and
+    /// x86_64-pc-windows-gnu targets and mingw-w64).
+    Wine {
+        /// A debug build.
+        #[arg(long)]
+        debug: bool,
+    },
 }
 
 fn main() -> Result<()> {
     let root = workspace_root();
     match Cli::parse().command {
         Cmd::Policy { staged } => policy::run(&root, staged),
+        Cmd::Wine { debug } => wine::run(&root, debug),
         Cmd::InstallHooks => {
             let status = Command::new("git")
                 .args(["config", "core.hooksPath", ".githooks"])
