@@ -257,10 +257,12 @@ pub(crate) fn rec(list: &ID3D12GraphicsCommandList) -> D3d12List<'_> {
     D3d12List(list)
 }
 
-/// A compute pipeline: its root signature and state.
+/// A compute pipeline: its root signature, state, and the root
+/// signature's parameters (where dispatch arguments go).
 pub(crate) struct D3d12Pipeline {
     pub(crate) root: ID3D12RootSignature,
     pub(crate) state: ID3D12PipelineState,
+    pub(crate) parameters: Vec<victory_host::root::Kind>,
 }
 
 /// A D3D12 command list seen through the host seam.
@@ -278,19 +280,36 @@ impl Recorder for D3d12List<'_> {
         bindings: &[Binding<'_, ID3D12Resource>],
         groups: [u32; 3],
     ) {
-        // SAFETY: the caller's open list, live resources and ranges; the
-        // root signature's parameters follow ComputeDesc's model.
+        use victory_host::root::{Kind, parameter};
+        // SAFETY: the caller's open list, live resources and ranges;
+        // arguments go where the root signature's parameters say
+        // (ComputeDesc).
         unsafe {
             self.0.SetComputeRootSignature(&pipeline.root);
             self.0.SetPipelineState(&pipeline.state);
-            if !constants.is_empty() {
-                self.0.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
-            }
-            for (i, b) in bindings.iter().enumerate() {
-                let slot = i as u32 + 1;
-                match *b {
-                    Binding::Read(r, offset) => self.0.SetComputeRootShaderResourceView(slot, r.GetGPUVirtualAddress() + offset),
-                    Binding::Write(r, offset) => self.0.SetComputeRootUnorderedAccessView(slot, r.GetGPUVirtualAddress() + offset),
+            let (mut constants, mut bindings) = (constants, bindings.iter());
+            for (i, p) in pipeline.parameters.iter().enumerate() {
+                let i = i as u32;
+                match *p {
+                    Kind::Constants { count, .. } => {
+                        let n = (count as usize).min(constants.len());
+                        if n > 0 {
+                            self.0.SetComputeRoot32BitConstants(i, n as u32, constants.as_ptr().cast(), 0);
+                        }
+                        constants = &constants[n..];
+                    }
+                    Kind::Descriptor { kind, .. } => {
+                        let Some(&(Binding::Read(r, offset) | Binding::Write(r, offset))) = bindings.next() else {
+                            continue;
+                        };
+                        let address = r.GetGPUVirtualAddress() + offset;
+                        match kind {
+                            parameter::CBV => self.0.SetComputeRootConstantBufferView(i, address),
+                            parameter::SRV => self.0.SetComputeRootShaderResourceView(i, address),
+                            _ => self.0.SetComputeRootUnorderedAccessView(i, address),
+                        }
+                    }
+                    Kind::Table(_) => {}
                 }
             }
             self.0.Dispatch(groups[0], groups[1], groups[2]);
@@ -485,10 +504,18 @@ impl Device for D3d12<'_> {
         let ShaderCode::Dxil(code) = desc.code else {
             return Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG));
         };
-        // SAFETY: a serialized root signature and a DXIL container; D3D12
-        // validates both.
+        // No root signature given: the one embedded in the shader.
+        let blob = if desc.root_signature.is_empty() { code } else { desc.root_signature };
+        let parameters = victory_host::root::parse(blob)
+            .map_err(|_| windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG))?
+            .parameters
+            .into_iter()
+            .map(|p| p.kind)
+            .collect();
+        // SAFETY: a serialized root signature (or a DXIL container with
+        // one) and a DXIL container; D3D12 validates both.
         unsafe {
-            let root: ID3D12RootSignature = self.0.CreateRootSignature(0, desc.root_signature)?;
+            let root: ID3D12RootSignature = self.0.CreateRootSignature(0, blob)?;
             let state: ID3D12PipelineState = self.0.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 pRootSignature: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(&root))),
                 CS: D3D12_SHADER_BYTECODE {
@@ -497,7 +524,7 @@ impl Device for D3d12<'_> {
                 },
                 ..Default::default()
             })?;
-            Ok(D3d12Pipeline { root, state })
+            Ok(D3d12Pipeline { root, state, parameters })
         }
     }
 

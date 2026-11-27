@@ -4,9 +4,10 @@
 //! Slice 1: resources, heaps, descriptor heaps, views and samplers.
 //! Slice 2a: recording barriers and copies ([`MetalRecorder`]).
 //! Slice 3a: compute pipelines from MSL or a metallib, and dispatch.
-//! Slice 3b (started): DXIL through Metal Shader Converter. [`format`] and
-//! [`layout`] are portable (built and tested anywhere); the Metal calls
-//! are in `device`, macOS only.
+//! Slice 3b: DXIL through Metal Shader Converter, with root signatures
+//! handed in or embedded. [`format`], [`layout`] and [`toplevel`] are
+//! portable (built and tested anywhere); the Metal calls are in `device`,
+//! macOS only.
 //!
 //! How this reaches the emulator: victory runs as a Windows program under
 //! Wine; this crate builds as a native arm64 library the Windows side
@@ -16,6 +17,7 @@ use core::fmt;
 
 pub mod format;
 pub mod layout;
+pub mod toplevel;
 
 #[cfg(target_os = "macos")]
 mod device;

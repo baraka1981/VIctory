@@ -25,6 +25,8 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 
 8. slice 3b started: `irconverter.rs` loads `libmetalirconverter.dylib` at run time (saxaboom crate; `VICTORY_IRCONVERTER` overrides the path), converts DXIL compute shaders to a metallib (entry renamed `victory_main`, group size from reflection). Converted pipelines (`Abi::Converted`) get a top-level argument buffer at index 2: constants inline, then one 64-bit address per binding; bound buffers made resident with `useResource`. Mac test `converted_dxil_runs_on_the_gpu` (fixture `tests/fixtures/add.dxil`, dxc v1.8.2505 from `add.hlsl`) **passes on the MacBook (27 Nov)**: conversion, reflection group size, and the top-level argument buffer layout (constants inline, then 8-byte-aligned addresses) are confirmed for this model.
 
+9. slice 3b step 1, root signatures: `victory_host::root` parses serialized D3D12 root signatures (1.0 / 1.1, DXBC container or bare `RTS0`; byte-exact `serialize` too), unit-tested on Linux against dxc-built blobs (`root::samples`, from `victory-host/tests/fixtures/root_signatures.hlsl`). `ComputeDesc` contract now: walk the root signature's parameters in order, root constants take the next N constants, root CBV/SRV/UAV the next binding (tables: step 2); empty `root_signature` = the DXIL's embedded one. D3D12 (`D3d12List::dispatch`) follows it too. Metal: `irconverter::root_signature` builds `IRVersionedRootSignatureDescriptor` (version kept), set as the compiler's global root signature (embedded one ignored); `toplevel::TopLevel` lays out the top-level argument buffer per parameter (constants 4-aligned inline, root descriptors and tables 8-byte addresses). Mac tests: `separate_root_signature_runs_on_the_gpu` (`swap.dxil`, root signature stripped, handed in: UAV, constants(2), SRV), `irconverter_layout_matches` (our offsets vs MSC's `resource_locations()` for RS10 / RS11 / swap). **Not yet run on the Mac.**
+
 ## Still direct D3D12 in victory-gpu
 
 - barriers + copies: all production ones go through `Recorder` now (`record_barriers`, `rec(list).copy_*`, with `barrier_of` / `location_of` converting D3D12-built structs). Left direct: diagnostics (`capture.rs`), probes + test helpers (`memory/*`), GPU tests. Next cleanup: build `Barrier`/`Location` at the call sites instead of converting.
@@ -37,7 +39,7 @@ Branch `metal-backend` on baraka1981/VIctory. Goal: run on Apple silicon with a 
 ## Next slices
 
 2. ~~2a barriers/copies~~ done. **Order from here: slice 3 before 2b** — Metal can't record a draw or dispatch without a pipeline, so pipelines + root signatures come first.
-3. ~~3a compute pipelines + dispatch~~ done. 3b (converter wired + verified on GPU; still to do): turn separately-supplied root signatures (what victory-gpu's translated shaders use) into MSC descriptors, descriptor tables (heap-indexed resources), Metal Shader Converter (`libmetalirconverter.dylib`, Apple developer download) loaded at runtime: DXIL -> metallib, root signature -> top-level argument buffer; then graphics pipelines, and moving victory-gpu's 11 compute PSOs / 14 root signatures onto the seam. Tile mapping for sparse.
+3. ~~3a compute pipelines + dispatch~~ done. 3b: ~~converter wired~~, ~~separately-supplied root signatures -> MSC descriptors + top-level layout~~ (step 1); step 2 descriptor tables in the top-level argument buffer (24-byte `IRDescriptorTableEntry` heaps) + `useResource`/`useHeap` residency; step 3 graphics pipelines (VS+PS, then mesh) through the seam. Then moving victory-gpu's 11 compute PSOs / 14 root signatures onto the seam. Tile mapping for sparse.
 4. Wine unixlib bridge: Windows-side proxy impl of `Device` that marshals to `victory-metal`
 5. present (CAMetalLayer via winemac.drv's view) + MetalFX instead of FSR
 
@@ -61,11 +63,16 @@ RUSTC_BOOTSTRAP=1 cargo check -Zbuild-std=std,panic_abort --target aarch64-apple
 
 On a real Mac just `cargo test -p victory-metal` (runs the GPU smoke tests in `device.rs`).
 
+Toolchain: `rust-toolchain.toml` pins 1.98.1, which the cloud box can't download; there `RUSTUP_TOOLCHAIN=stable` (1.97.0) with the 1.97.0 library source above. `bcpack-tables.bin` only needs to exist for a type-check (`touch` it; it's ignored).
+
+Test DXIL: Microsoft's Linux dxc release (v1.8.2505, `linux_dxc_2025_05_24.x86_64.tar.gz`), `LD_LIBRARY_PATH=<dxc>/lib <dxc>/bin/dxc ...`. `cargo xtask policy` lets `crates/victory-metal/tests/fixtures/<stem>.dxil` in only beside its `<stem>.hlsl`. Root signature blobs aren't committed as files; dxc-built ones are byte arrays in `victory_host::root::samples`.
+
 Type-checks only. Runtime still needs: Windows + a game for the D3D12 side, a Mac for Metal.
 
 ## Gotchas
 
 - `crates/victory-formats/src/bcpack-tables.bin` comes from `Initialize-FormatTables.ps1` (or curl the pinned Marvisak URL in that script, check the SHA-256); bcpack tests fail without it.
+- MSC is told to ignore the embedded root signature when one is handed in (D3D12: the PSO's wins). Untested with both present and different.
 - Metal table entry metadata words follow MSC's runtime header from memory — check vs `metal_irconverter_runtime.h` when shaders run. Typed buffer SRV/UAVs need texture-buffer views (TODO), stencil-plane views too.
 - Packed 16-bit formats (B5G6R5, BGR5A1, B4G4R4A4) channel order vs Metal unverified — needs a draw-and-read test.
 - No D24S8 on Apple silicon → D32FS8 (same as MoltenVK/D3DMetal).

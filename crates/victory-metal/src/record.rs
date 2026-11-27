@@ -118,8 +118,9 @@ impl Recorder for MetalRecorder {
     type Resource = MetalResource;
     type Pipeline = MetalPipeline;
 
-    /// One compute encoder per dispatch: constants at buffer index 0,
-    /// bindings from 1 (ComputeDesc's model).
+    /// One compute encoder per dispatch. Converted DXIL: the top-level
+    /// argument buffer its root signature lays out. Our own shaders:
+    /// constants at buffer index 0, bindings from 1.
     unsafe fn dispatch(
         &self,
         pipeline: &MetalPipeline,
@@ -142,7 +143,7 @@ impl Recorder for MetalRecorder {
                     buffer(r).map_or(0, |b| b.gpuAddress() + offset)
                 })
                 .collect();
-            let table = crate::irconverter::argument_buffer(constants, &addresses);
+            let table = pipeline.top.fill(constants, &addresses, &[]);
             unsafe {
                 enc.setBytes_length_atIndex(
                     std::ptr::NonNull::from(&table[0]).cast(),

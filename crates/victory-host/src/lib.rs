@@ -14,6 +14,8 @@
 
 use core::fmt;
 
+pub mod root;
+
 /// A resource's shape and use, laid out as D3D12.X's (and D3D12's)
 /// `D3D12_RESOURCE_DESC`, so the title's descriptions are read as is.
 #[repr(C)]
@@ -313,12 +315,17 @@ pub enum ShaderCode<'a> {
     MetalLib(&'a [u8]),
 }
 
-/// A compute pipeline with the simple binding model slice 3a supports:
-/// 32-bit constants first, then one buffer per binding, in order.
+/// A compute pipeline.
 ///
-/// D3D12: `root_signature` is a serialized root signature whose parameter
-/// 0 is the constants and parameters 1.. root SRVs/UAVs matching the
-/// bindings. Metal: constants are buffer index 0, bindings 1..
+/// Its root signature says where a dispatch's arguments go: walking its
+/// parameters in order, each root constants parameter takes the next
+/// `count` of the dispatch's constants, and each root CBV / SRV / UAV the
+/// next binding. (Descriptor tables: slice 3b, step 2.)
+///
+/// D3D12 and converted DXIL on Metal: `root_signature` is serialized
+/// ([`root`]: a container or a bare `RTS0` part); empty means the one
+/// embedded in the DXIL. Metal's own shaders (MSL, metallib) have none:
+/// constants at buffer index 0, bindings from 1.
 #[derive(Debug, Clone, Copy)]
 pub struct ComputeDesc<'a> {
     pub code: ShaderCode<'a>,
@@ -332,9 +339,9 @@ pub struct ComputeDesc<'a> {
 /// A buffer bound for a dispatch.
 #[derive(Debug)]
 pub enum Binding<'a, R> {
-    /// Read-only (D3D12 root SRV) from `offset`.
+    /// Read-only (root SRV or CBV) from `offset`.
     Read(&'a R, u64),
-    /// Read-write (D3D12 root UAV) from `offset`.
+    /// Read-write (root UAV) from `offset`.
     Write(&'a R, u64),
 }
 

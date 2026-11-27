@@ -20,6 +20,7 @@ use victory_host::{
 };
 
 use crate::record::MetalRecorder;
+use crate::toplevel::TopLevel;
 use crate::views::{self, Kept, Slots, Target, resource_id};
 use crate::{DESCRIPTOR_BYTES, MetalError, format, layout};
 
@@ -57,6 +58,9 @@ pub struct MetalPipeline {
     pub state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub threads: [u32; 3],
     pub abi: Abi,
+    /// The top-level argument buffer's layout ([`Abi::Converted`]; empty
+    /// for [`Abi::Direct`]).
+    pub top: TopLevel,
 }
 
 pub struct MetalDevice {
@@ -357,13 +361,25 @@ impl Device for MetalDevice {
         };
         let mut abi = Abi::Direct;
         let mut threads = desc.threads;
+        let mut top = TopLevel::default();
         let converted;
         let mut code = desc.code;
         if let ShaderCode::Dxil(dxil) = code {
             let entry = std::ffi::CString::new(desc.entry)
                 .map_err(|e| MetalError::Shader(e.to_string()))?;
-            converted = crate::irconverter::compute(dxil, &entry)?;
+            let given = !desc.root_signature.is_empty();
+            let blob = if given {
+                desc.root_signature
+            } else {
+                victory_host::root::embedded(dxil).ok_or_else(|| {
+                    MetalError::Shader("no root signature: none given, none embedded".into())
+                })?
+            };
+            let rs = victory_host::root::parse(blob)
+                .map_err(|e| MetalError::Shader(e.to_string()))?;
+            converted = crate::irconverter::compute(dxil, &entry, given.then_some(&rs))?;
             threads = converted.threads;
+            top = TopLevel::new(&rs);
             abi = Abi::Converted;
             code = ShaderCode::MetalLib(&converted.metallib);
         }
@@ -400,6 +416,7 @@ impl Device for MetalDevice {
             state,
             threads,
             abi,
+            top,
         })
     }
 
@@ -925,6 +942,158 @@ mod tests {
                 "element {n}"
             );
         }
+    }
+
+    /// A root signature handed in separately (the DXIL has none), in an
+    /// order unlike add.hlsl's: UAV, constants(2), SRV. Needs Metal Shader
+    /// Converter and `tests/fixtures/swap.dxil` (see swap.hlsl); skips
+    /// without the fixture.
+    #[test]
+    fn separate_root_signature_runs_on_the_gpu() {
+        use victory_host::{Binding, ComputeDesc, Recorder as _, ShaderCode};
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/swap.dxil");
+        let Ok(dxil) = std::fs::read(fixture) else {
+            eprintln!("skipped: no {fixture}");
+            return;
+        };
+        assert!(victory_host::root::embedded(&dxil).is_none(), "stripped");
+        let rs = crate::toplevel::swap_root_signature().serialize();
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &rs,
+                threads: [0; 3],
+            })
+            .expect("Metal Shader Converter converts the shader");
+        assert_eq!(pipeline.threads, [32, 1, 1], "group size from reflection");
+        let offsets: Vec<u32> = pipeline.top.entries.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, [0, 8, 16]);
+        let bytes = 256 * 4;
+        let input = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(bytes, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let (MetalResource::Buffer(i), MetalResource::Buffer(o)) = (&input, &out) else {
+            unreachable!()
+        };
+        let values = i.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            unsafe { values.add(n).write(n as u32) };
+        }
+        let rec = gpu.recorder().unwrap();
+        // Bindings in root-parameter order: the UAV, then the SRV.
+        unsafe {
+            rec.dispatch(
+                &pipeline,
+                &[3, 1000],
+                &[Binding::Write(&out, 0), Binding::Read(&input, 0)],
+                [8, 1, 1],
+            )
+        };
+        rec.commit_and_wait().expect("the dispatch runs");
+        let got = o.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            assert_eq!(
+                unsafe { got.add(n).read() },
+                n as u32 * 3 + 1000,
+                "element {n}"
+            );
+        }
+    }
+
+    /// crate::toplevel's offsets against where MSC itself says each
+    /// resource goes, for every parameter kind (RS10: constants, root
+    /// CBV/SRV/UAV, tables incl. unbounded and samplers, a static sampler;
+    /// RS11: version 1.1 flags; swap: addresses before constants). Needs
+    /// Metal Shader Converter, no GPU work.
+    #[test]
+    fn irconverter_layout_matches() {
+        use saxaboom::ffi::IRResourceType as T;
+        use victory_host::root::{self, Kind, RootSignature, parameter, range, samples};
+        let covers = |r: &root::Range, ty: u32, slot: u32, space: u32| {
+            r.kind == ty
+                && r.space == space
+                && slot >= r.register
+                && (r.count == root::UNBOUNDED || slot < r.register + r.count)
+        };
+        let check = |name: &str, rs: RootSignature| {
+            let top = crate::toplevel::TopLevel::new(&rs);
+            let locations = crate::irconverter::locations(&rs).expect("MSC takes the root signature");
+            eprintln!("{name}: ours {:?}", top.entries);
+            let mut matched = 0;
+            for l in &locations {
+                eprintln!(
+                    "{name}: MSC {:?} space {} slot {} at {} ({} bytes)",
+                    l.resourceType, l.space, l.slot, l.topLevelOffset, l.sizeBytes
+                );
+                let (param_ty, range_ty) = match l.resourceType {
+                    T::Constant => (Some(parameter::CONSTANTS), None),
+                    T::CBV => (Some(parameter::CBV), Some(range::CBV)),
+                    T::SRV => (Some(parameter::SRV), Some(range::SRV)),
+                    T::UAV => (Some(parameter::UAV), Some(range::UAV)),
+                    T::Sampler => (None, Some(range::SAMPLER)),
+                    T::Table => (None, None),
+                    _ => (None, None),
+                };
+                let found = rs.parameters.iter().position(|p| match &p.kind {
+                    Kind::Constants { register, space, .. } => {
+                        param_ty == Some(parameter::CONSTANTS)
+                            && (*register, *space) == (l.slot, l.space)
+                    }
+                    Kind::Descriptor { kind, register, space, .. } => {
+                        param_ty == Some(*kind) && (*register, *space) == (l.slot, l.space)
+                    }
+                    Kind::Table(ranges) => {
+                        l.resourceType == T::Table
+                            && ranges
+                                .first()
+                                .is_some_and(|r| (r.register, r.space) == (l.slot, l.space))
+                            || range_ty.is_some_and(|t| {
+                                ranges.iter().any(|r| covers(r, t, l.slot, l.space))
+                            })
+                    }
+                });
+                let static_sampler = l.resourceType == T::Sampler
+                    && rs.samplers.iter().any(|s| (s.register, s.space) == (l.slot, l.space));
+                match found {
+                    Some(i) => {
+                        assert_eq!(
+                            l.topLevelOffset, top.entries[i].offset,
+                            "{name}: parameter {i} ({:?})",
+                            l.resourceType
+                        );
+                        matched += 1;
+                    }
+                    None if static_sampler => {}
+                    None => panic!("{name}: MSC location {l:?} matches no parameter"),
+                }
+            }
+            assert!(matched > 0, "{name}: MSC reported nothing to compare");
+        };
+        if let Err(MetalError::Shader(why)) =
+            crate::irconverter::locations(&crate::toplevel::swap_root_signature())
+            && why.contains("not loaded")
+        {
+            eprintln!("skipped: {why}");
+            return;
+        }
+        check("RS10", root::parse(&samples::RS10).unwrap());
+        check("RS11", root::parse(&samples::RS11).unwrap());
+        check("swap", crate::toplevel::swap_root_signature());
     }
 
     #[test]
