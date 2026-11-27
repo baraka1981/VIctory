@@ -13,11 +13,19 @@ pub struct Block {
 }
 
 const fn texel(bytes: u32) -> Block {
-    Block { bytes, width: 1, height: 1 }
+    Block {
+        bytes,
+        width: 1,
+        height: 1,
+    }
 }
 
 const fn bc(bytes: u32) -> Block {
-    Block { bytes, width: 4, height: 4 }
+    Block {
+        bytes,
+        width: 4,
+        height: 4,
+    }
 }
 
 /// A format as Metal has it.
@@ -207,7 +215,11 @@ pub fn map(format: u32, depth: bool) -> Option<Mapped> {
         118..=120 => (DEPTH32_FLOAT_STENCIL8, texel(8), format == 118),
         _ => return None,
     };
-    Some(Mapped { pixel_format, block, typeless })
+    Some(Mapped {
+        pixel_format,
+        block,
+        typeless,
+    })
 }
 
 /// Bytes and block shape of a D3D12.X format as the *console* stores it,
@@ -246,7 +258,10 @@ mod tests {
         assert_eq!(map(39, false).unwrap().pixel_format, mtl::R32_FLOAT);
         assert_eq!(map(53, true).unwrap().pixel_format, mtl::DEPTH16_UNORM);
         assert!(map(39, false).unwrap().typeless);
-        assert_eq!(map(45, true).unwrap().pixel_format, mtl::DEPTH32_FLOAT_STENCIL8);
+        assert_eq!(
+            map(45, true).unwrap().pixel_format,
+            mtl::DEPTH32_FLOAT_STENCIL8
+        );
     }
 
     #[test]
@@ -261,9 +276,16 @@ mod tests {
         // Every mapped colour format stores texels as the console does;
         // only depth (D24S8, D16S8 -> D32FS8) is allowed to differ.
         for f in 1..=200 {
-            let (Some(m), Some(c)) = (map(f, false), console_block(f)) else { continue };
+            let (Some(m), Some(c)) = (map(f, false), console_block(f)) else {
+                continue;
+            };
             let depth = m.pixel_format == mtl::DEPTH32_FLOAT_STENCIL8;
-            assert!(depth || m.block == c, "format {f}: {:?} vs console {:?}", m.block, c);
+            assert!(
+                depth || m.block == c,
+                "format {f}: {:?} vs console {:?}",
+                m.block,
+                c
+            );
         }
     }
 }

@@ -3,7 +3,8 @@
 //!
 //! Slice 1: resources, heaps, descriptor heaps, views and samplers.
 //! Slice 2a: recording barriers and copies ([`MetalRecorder`]).
-//! Slice 3a: compute pipelines from MSL or a metallib, and dispatch. [`format`] and
+//! Slice 3a: compute pipelines from MSL or a metallib, and dispatch.
+//! Slice 3b (started): DXIL through Metal Shader Converter. [`format`] and
 //! [`layout`] are portable (built and tested anywhere); the Metal calls
 //! are in `device`, macOS only.
 //!
@@ -19,11 +20,13 @@ pub mod layout;
 #[cfg(target_os = "macos")]
 mod device;
 #[cfg(target_os = "macos")]
+mod irconverter;
+#[cfg(target_os = "macos")]
 mod record;
 #[cfg(target_os = "macos")]
 mod views;
 #[cfg(target_os = "macos")]
-pub use device::{MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource};
+pub use device::{Abi, MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource};
 #[cfg(target_os = "macos")]
 pub use record::MetalRecorder;
 #[cfg(target_os = "macos")]

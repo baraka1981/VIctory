@@ -606,7 +606,13 @@ mod tests {
     #[test]
     fn buffer_is_row_major_and_single() {
         let b = ResourceDesc::buffer(4096, flags::UNORDERED_ACCESS);
-        assert_eq!((b.dimension, b.width, b.height, b.layout), (dimension::BUFFER, 4096, 1, ROW_MAJOR));
-        assert_eq!((b.mip_levels, b.depth_or_array_size, b.sample_count), (1, 1, 1));
+        assert_eq!(
+            (b.dimension, b.width, b.height, b.layout),
+            (dimension::BUFFER, 4096, 1, ROW_MAJOR)
+        );
+        assert_eq!(
+            (b.mip_levels, b.depth_or_array_size, b.sample_count),
+            (1, 1, 1)
+        );
     }
 }

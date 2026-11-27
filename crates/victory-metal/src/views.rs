@@ -26,7 +26,9 @@ use objc2_metal::{
     MTLSamplerBorderColor, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
     MTLSamplerReductionMode, MTLSamplerState, MTLTexture, MTLTextureType,
 };
-use victory_host::{DepthViewDesc, SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, view};
+use victory_host::{
+    DepthViewDesc, SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, view,
+};
 
 use crate::format;
 
@@ -139,7 +141,11 @@ pub(crate) fn texture_view(
     };
     let first_mip = first_mip as usize;
     let first_slice = first_slice as usize;
-    let mips = if mips == u32::MAX { all_mips.saturating_sub(first_mip) } else { mips as usize };
+    let mips = if mips == u32::MAX {
+        all_mips.saturating_sub(first_mip)
+    } else {
+        mips as usize
+    };
     let slices = match kind {
         MTLTextureType::TypeCube => 6,
         MTLTextureType::TypeCubeArray => slices as usize * 6,
@@ -169,14 +175,27 @@ pub(crate) fn texture_view(
 
 /// A shader resource view of a texture.
 pub(crate) fn shader_texture(texture: &Texture, desc: Option<&ShaderViewDesc>) -> Option<Texture> {
-    let Some(d) = desc else { return Some(texture.clone()) };
+    let Some(d) = desc else {
+        return Some(texture.clone());
+    };
     let (mip, mips, slice, slices) = d.texture();
-    texture_view(texture, d.format, view_type(d.dimension)?, (mip, mips), (slice, slices))
+    texture_view(
+        texture,
+        d.format,
+        view_type(d.dimension)?,
+        (mip, mips),
+        (slice, slices),
+    )
 }
 
 /// An unordered access view of a texture: one mip.
-pub(crate) fn unordered_texture(texture: &Texture, desc: Option<&UnorderedViewDesc>) -> Option<Texture> {
-    let Some(d) = desc else { return Some(texture.clone()) };
+pub(crate) fn unordered_texture(
+    texture: &Texture,
+    desc: Option<&UnorderedViewDesc>,
+) -> Option<Texture> {
+    let Some(d) = desc else {
+        return Some(texture.clone());
+    };
     let w = |i: usize| (d.fields[i / 2] >> (32 * (i % 2))) as u32;
     let (mip, slice, slices) = match d.dimension {
         view::TEXTURE_1D_ARRAY | view::TEXTURE_2D_ARRAY => (w(0), w(1), w(2)),
@@ -186,7 +205,13 @@ pub(crate) fn unordered_texture(texture: &Texture, desc: Option<&UnorderedViewDe
         view::TEXTURE_2D_MS => (0, 0, 1),
         _ => (w(0), 0, 1),
     };
-    texture_view(texture, d.format, view_type(d.dimension)?, (mip, 1), (slice, slices))
+    texture_view(
+        texture,
+        d.format,
+        view_type(d.dimension)?,
+        (mip, 1),
+        (slice, slices),
+    )
 }
 
 /// Bytes per element of a buffer view.
@@ -237,10 +262,20 @@ fn border(rgba: [f32; 4]) -> MTLSamplerBorderColor {
 pub(crate) fn sampler(device: &ProtocolObject<dyn MTLDevice>, d: &SamplerDesc) -> Option<Sampler> {
     let s = MTLSamplerDescriptor::new();
     let linear = |bit: u32| d.filter & bit != 0;
-    let filter = |bit| if linear(bit) { MTLSamplerMinMagFilter::Linear } else { MTLSamplerMinMagFilter::Nearest };
+    let filter = |bit| {
+        if linear(bit) {
+            MTLSamplerMinMagFilter::Linear
+        } else {
+            MTLSamplerMinMagFilter::Nearest
+        }
+    };
     s.setMinFilter(filter(0x10));
     s.setMagFilter(filter(0x4));
-    s.setMipFilter(if linear(0x1) { MTLSamplerMipFilter::Linear } else { MTLSamplerMipFilter::Nearest });
+    s.setMipFilter(if linear(0x1) {
+        MTLSamplerMipFilter::Linear
+    } else {
+        MTLSamplerMipFilter::Nearest
+    });
     if d.filter & 0x40 != 0 {
         s.setMaxAnisotropy(d.max_anisotropy.clamp(1, 16) as usize);
     }
@@ -266,7 +301,11 @@ pub(crate) fn sampler(device: &ProtocolObject<dyn MTLDevice>, d: &SamplerDesc) -
 /// A render target view: texture, mip and slice.
 pub(crate) fn target(texture: &Texture, desc: Option<&TargetViewDesc>) -> Option<Target> {
     let Some(d) = desc else {
-        return Some(Target { texture: texture.clone(), level: 0, slice: 0 });
+        return Some(Target {
+            texture: texture.clone(),
+            level: 0,
+            slice: 0,
+        });
     };
     let w = |i: usize| (d.fields[i / 2] >> (32 * (i % 2))) as usize;
     // RTV dimensions: 1D=2, 1D array=3, 2D=4, 2D array=5, MS=6, MS array=7, 3D=8.
@@ -277,14 +316,28 @@ pub(crate) fn target(texture: &Texture, desc: Option<&TargetViewDesc>) -> Option
         6 => (0, 0),
         _ => (w(0), 0),
     };
-    let texture = texture_view(texture, d.format, texture.textureType(), (0, u32::MAX), (0, u32::MAX))?;
-    Some(Target { texture, level, slice })
+    let texture = texture_view(
+        texture,
+        d.format,
+        texture.textureType(),
+        (0, u32::MAX),
+        (0, u32::MAX),
+    )?;
+    Some(Target {
+        texture,
+        level,
+        slice,
+    })
 }
 
 /// A depth-stencil view: texture, mip and slice.
 pub(crate) fn depth(texture: &Texture, desc: Option<&DepthViewDesc>) -> Target {
     let Some(d) = desc else {
-        return Target { texture: texture.clone(), level: 0, slice: 0 };
+        return Target {
+            texture: texture.clone(),
+            level: 0,
+            slice: 0,
+        };
     };
     // DSV dimensions: 1D=1, 1D array=2, 2D=3, 2D array=4, MS=5, MS array=6.
     let (level, slice) = match d.dimension {
@@ -293,5 +346,9 @@ pub(crate) fn depth(texture: &Texture, desc: Option<&DepthViewDesc>) -> Target {
         5 => (0, 0),
         _ => (d.fields[0], 0),
     };
-    Target { texture: texture.clone(), level: level as usize, slice: slice as usize }
+    Target {
+        texture: texture.clone(),
+        level: level as usize,
+        slice: slice as usize,
+    }
 }

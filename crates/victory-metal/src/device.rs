@@ -6,16 +6,17 @@
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLLibrary, MTLDevice, MTLHeap, MTLHeapDescriptor, MTLHeapType,
-    MTLPixelFormat, MTLResourceOptions, MTLSamplerState, MTLStorageMode, MTLTexture,
-    MTLTextureDescriptor, MTLTextureType, MTLTextureUsage,
-};
 use objc2_foundation::{NSString, NSURL};
+use objc2_metal::{
+    MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLLibrary, MTLPixelFormat, MTLResourceOptions,
+    MTLSamplerState, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+    MTLTextureUsage,
+};
 use victory_host::{
-    ComputeDesc, ShaderCode,
-    Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
-    SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc, dimension, flags, view,
+    Allocation, ClearValue, ComputeDesc, DepthViewDesc, Descriptors, Device, HeapUse, Memory,
+    ResourceDesc, SamplerDesc, ShaderCode, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
+    dimension, flags, view,
 };
 
 use crate::record::MetalRecorder;
@@ -41,10 +42,21 @@ pub struct MetalDescriptorHeap {
     pub table: Buffer,
 }
 
+/// How a pipeline's shader finds its resources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abi {
+    /// Our own shaders: constants at buffer 0, bindings from 1.
+    Direct,
+    /// Converted DXIL: a top-level argument buffer at
+    /// `irconverter::ARGUMENT_BUFFER_INDEX`.
+    Converted,
+}
+
 /// A compute pipeline and the group size its shader declares.
 pub struct MetalPipeline {
     pub state: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pub threads: [u32; 3],
+    pub abi: Abi,
 }
 
 pub struct MetalDevice {
@@ -58,7 +70,9 @@ impl MetalDevice {
     /// The system's default GPU (the only one on Apple silicon).
     pub fn system_default() -> Result<MetalDevice, MetalError> {
         let device = MTLCreateSystemDefaultDevice().ok_or(MetalError::NoDevice)?;
-        let queue = device.newCommandQueue().ok_or(MetalError::Failed("a command queue"))?;
+        let queue = device
+            .newCommandQueue()
+            .ok_or(MetalError::Failed("a command queue"))?;
         Ok(MetalDevice {
             device,
             slots: Slots::default(),
@@ -68,7 +82,10 @@ impl MetalDevice {
 
     /// A new command buffer to record into.
     pub fn recorder(&self) -> Result<MetalRecorder, MetalError> {
-        let buffer = self.queue.commandBuffer().ok_or(MetalError::Failed("a command buffer"))?;
+        let buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MetalError::Failed("a command buffer"))?;
         Ok(MetalRecorder::new(buffer))
     }
 
@@ -92,9 +109,14 @@ impl MetalDevice {
         unsafe { views::write(at, words) }
     }
 
-    fn texture_entry(texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>) -> ([u64; 3], Option<Kept>) {
+    fn texture_entry(
+        texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    ) -> ([u64; 3], Option<Kept>) {
         match texture {
-            Some(t) => ([0, resource_id(t.gpuResourceID()), 0], Some(Kept::Texture(t))),
+            Some(t) => (
+                [0, resource_id(t.gpuResourceID()), 0],
+                Some(Kept::Texture(t)),
+            ),
             // A view Metal refused reads as a null one.
             None => ([0; 3], None),
         }
@@ -103,7 +125,9 @@ impl MetalDevice {
 
 /// A short hash for temporary file names.
 fn fxhash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)
+    })
 }
 
 fn storage(memory: Memory) -> MTLStorageMode {
@@ -244,7 +268,12 @@ impl Device for MetalDevice {
         } else {
             match texture_descriptor(desc, MTLStorageMode::Private) {
                 Ok(d) => self.device.heapTextureSizeAndAlignWithDescriptor(&d),
-                Err(_) => return Allocation { size: 0, alignment: 0 },
+                Err(_) => {
+                    return Allocation {
+                        size: 0,
+                        alignment: 0,
+                    };
+                }
             }
         };
         Allocation {
@@ -323,8 +352,26 @@ impl Device for MetalDevice {
     }
 
     fn compute_pipeline(&self, desc: &ComputeDesc<'_>) -> Result<MetalPipeline, MetalError> {
-        let shader = |e: Retained<objc2_foundation::NSError>| MetalError::Shader(e.localizedDescription().to_string());
-        let library: Retained<ProtocolObject<dyn MTLLibrary>> = match desc.code {
+        let shader = |e: Retained<objc2_foundation::NSError>| {
+            MetalError::Shader(e.localizedDescription().to_string())
+        };
+        let mut abi = Abi::Direct;
+        let mut threads = desc.threads;
+        let converted;
+        let mut code = desc.code;
+        if let ShaderCode::Dxil(dxil) = code {
+            let entry = std::ffi::CString::new(desc.entry)
+                .map_err(|e| MetalError::Shader(e.to_string()))?;
+            converted = crate::irconverter::compute(dxil, &entry)?;
+            threads = converted.threads;
+            abi = Abi::Converted;
+            code = ShaderCode::MetalLib(&converted.metallib);
+        }
+        let entry = match abi {
+            Abi::Converted => crate::irconverter::ENTRY.to_str().unwrap_or("victory_main"),
+            Abi::Direct => desc.entry,
+        };
+        let library: Retained<ProtocolObject<dyn MTLLibrary>> = match code {
             ShaderCode::Msl(source) => self
                 .device
                 .newLibraryWithSource_options_error(&NSString::from_str(source), None)
@@ -332,25 +379,36 @@ impl Device for MetalDevice {
             ShaderCode::MetalLib(bytes) => {
                 // Metal reads libraries from files or dispatch data; a file
                 // keeps this free of libdispatch bindings.
-                let path = std::env::temp_dir().join(format!("victory-{:x}.metallib", fxhash(bytes)));
+                let path =
+                    std::env::temp_dir().join(format!("victory-{:x}.metallib", fxhash(bytes)));
                 std::fs::write(&path, bytes).map_err(|e| MetalError::Shader(e.to_string()))?;
                 let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
                 let made = self.device.newLibraryWithURL_error(&url).map_err(shader);
                 let _ = std::fs::remove_file(&path);
                 made?
             }
-            ShaderCode::Dxil(_) => {
-                return Err(MetalError::Shader("DXIL needs Metal Shader Converter (slice 3b)".into()));
-            }
+            ShaderCode::Dxil(_) => unreachable!("converted above"),
         };
         let function = library
-            .newFunctionWithName(&NSString::from_str(desc.entry))
-            .ok_or_else(|| MetalError::Shader(format!("no function {}", desc.entry)))?;
-        let state = self.device.newComputePipelineStateWithFunction_error(&function).map_err(shader)?;
-        Ok(MetalPipeline { state, threads: desc.threads })
+            .newFunctionWithName(&NSString::from_str(entry))
+            .ok_or_else(|| MetalError::Shader(format!("no function {entry}")))?;
+        let state = self
+            .device
+            .newComputePipelineStateWithFunction_error(&function)
+            .map_err(shader)?;
+        Ok(MetalPipeline {
+            state,
+            threads,
+            abi,
+        })
     }
 
-    fn copy_layout(&self, desc: &ResourceDesc, first: u32, out: &mut [victory_host::Footprint]) -> u64 {
+    fn copy_layout(
+        &self,
+        desc: &ResourceDesc,
+        first: u32,
+        out: &mut [victory_host::Footprint],
+    ) -> u64 {
         layout::layout(desc, first, out).unwrap_or(0)
     }
 
@@ -358,11 +416,18 @@ impl Device for MetalDevice {
         heap.table.contents().as_ptr() as usize
     }
 
-    unsafe fn shader_view(&self, resource: Option<&MetalResource>, desc: Option<&ShaderViewDesc>, at: usize) {
+    unsafe fn shader_view(
+        &self,
+        resource: Option<&MetalResource>,
+        desc: Option<&ShaderViewDesc>,
+        at: usize,
+    ) {
         let (words, kept) = match resource {
             None => ([0; 3], None),
             Some(MetalResource::Buffer(b)) => match desc {
-                Some(d) if d.dimension == view::BUFFER => (views::buffer_entry(b, d.buffer(), d.format), None),
+                Some(d) if d.dimension == view::BUFFER => {
+                    (views::buffer_entry(b, d.buffer(), d.format), None)
+                }
                 _ => ([b.gpuAddress(), 0, b.length() as u64], None),
             },
             Some(MetalResource::Texture(t)) => Self::texture_entry(views::shader_texture(t, desc)),
@@ -380,10 +445,14 @@ impl Device for MetalDevice {
         let (words, kept) = match resource {
             None => ([0; 3], None),
             Some(MetalResource::Buffer(b)) => match desc {
-                Some(d) if d.dimension == view::BUFFER => (views::buffer_entry(b, d.buffer(), d.format), None),
+                Some(d) if d.dimension == view::BUFFER => {
+                    (views::buffer_entry(b, d.buffer(), d.format), None)
+                }
                 _ => ([b.gpuAddress(), 0, b.length() as u64], None),
             },
-            Some(MetalResource::Texture(t)) => Self::texture_entry(views::unordered_texture(t, desc)),
+            Some(MetalResource::Texture(t)) => {
+                Self::texture_entry(views::unordered_texture(t, desc))
+            }
         };
         // SAFETY: the caller's slot.
         unsafe { self.put(at, words, kept) }
@@ -397,7 +466,11 @@ impl Device for MetalDevice {
     unsafe fn sampler(&self, desc: &SamplerDesc, at: usize) {
         let (words, kept) = match views::sampler(&self.device, desc) {
             Some(s) => (
-                [resource_id(s.gpuResourceID()), 0, u64::from(desc.mip_lod_bias.to_bits())],
+                [
+                    resource_id(s.gpuResourceID()),
+                    0,
+                    u64::from(desc.mip_lod_bias.to_bits()),
+                ],
                 Some(Kept::Sampler(s)),
             ),
             None => ([0; 3], None),
@@ -406,24 +479,40 @@ impl Device for MetalDevice {
         unsafe { self.put(at, words, kept) }
     }
 
-    unsafe fn target_view(&self, resource: Option<&MetalResource>, desc: Option<&TargetViewDesc>, at: usize) {
+    unsafe fn target_view(
+        &self,
+        resource: Option<&MetalResource>,
+        desc: Option<&TargetViewDesc>,
+        at: usize,
+    ) {
         let target = match resource {
             Some(MetalResource::Texture(t)) => views::target(t, desc),
             _ => None,
         };
         let (words, kept) = match target {
-            Some(t) => ([0, resource_id(t.texture.gpuResourceID()), 0], Some(Kept::Target(t))),
+            Some(t) => (
+                [0, resource_id(t.texture.gpuResourceID()), 0],
+                Some(Kept::Target(t)),
+            ),
             None => ([0; 3], None),
         };
         // SAFETY: the caller's slot.
         unsafe { self.put(at, words, kept) }
     }
 
-    unsafe fn depth_view(&self, resource: Option<&MetalResource>, desc: Option<&DepthViewDesc>, at: usize) {
+    unsafe fn depth_view(
+        &self,
+        resource: Option<&MetalResource>,
+        desc: Option<&DepthViewDesc>,
+        at: usize,
+    ) {
         let (words, kept) = match resource {
             Some(MetalResource::Texture(t)) => {
                 let target = views::depth(t, desc);
-                ([0, resource_id(target.texture.gpuResourceID()), 0], Some(Kept::Target(target)))
+                (
+                    [0, resource_id(target.texture.gpuResourceID()), 0],
+                    Some(Kept::Target(target)),
+                )
             }
             _ => ([0; 3], None),
         };
@@ -465,9 +554,12 @@ mod tests {
     fn makes_buffers_textures_heaps_and_tables() {
         let gpu = MetalDevice::system_default().expect("a Metal device");
 
-        let Ok(MetalResource::Buffer(b)) =
-            gpu.committed(Memory::Upload, &ResourceDesc::buffer(4096, 0), state::GENERIC_READ, None)
-        else {
+        let Ok(MetalResource::Buffer(b)) = gpu.committed(
+            Memory::Upload,
+            &ResourceDesc::buffer(4096, 0),
+            state::GENERIC_READ,
+            None,
+        ) else {
             panic!("upload buffer")
         };
         assert_eq!(b.length(), 4096);
@@ -480,7 +572,8 @@ mod tests {
         }
 
         let desc = texture(256, 128, 28, flags::RENDER_TARGET);
-        let Ok(MetalResource::Texture(t)) = gpu.committed(Memory::Device, &desc, state::COMMON, None)
+        let Ok(MetalResource::Texture(t)) =
+            gpu.committed(Memory::Device, &desc, state::COMMON, None)
         else {
             panic!("render target")
         };
@@ -489,7 +582,8 @@ mod tests {
 
         // Depth: typeless R32 family as a depth target.
         let depth = texture(64, 64, 39, flags::DEPTH_STENCIL);
-        let Ok(MetalResource::Texture(d)) = gpu.committed(Memory::Device, &depth, state::COMMON, None)
+        let Ok(MetalResource::Texture(d)) =
+            gpu.committed(Memory::Device, &depth, state::COMMON, None)
         else {
             panic!("depth target")
         };
@@ -500,7 +594,12 @@ mod tests {
         let a = gpu.allocation(&small);
         assert!(a.size > 0 && a.alignment > 0);
         let heap = gpu
-            .heap(Memory::Device, a.size.next_multiple_of(a.alignment) * 2, 0, HeapUse::Textures)
+            .heap(
+                Memory::Device,
+                a.size.next_multiple_of(a.alignment) * 2,
+                0,
+                HeapUse::Textures,
+            )
             .expect("heap");
         for i in 0..2 {
             let offset = a.size.next_multiple_of(a.alignment) * i;
@@ -518,7 +617,9 @@ mod tests {
             Err(e) => eprintln!("no sparse texture here: {e}"),
         }
 
-        let table = gpu.descriptor_heap(Descriptors::Views, 1000, true).expect("table");
+        let table = gpu
+            .descriptor_heap(Descriptors::Views, 1000, true)
+            .expect("table");
         assert_eq!(table.table.length(), 1000 * DESCRIPTOR_BYTES as usize);
         assert_eq!(gpu.descriptor_step(Descriptors::Views), DESCRIPTOR_BYTES);
     }
@@ -531,11 +632,17 @@ mod tests {
         let step = gpu.descriptor_step(Descriptors::Views) as usize;
         let entry = |i: usize| unsafe { ((start + i * step) as *const [u64; 3]).read() };
 
-        let Ok(buffer) = gpu.committed(Memory::Device, &ResourceDesc::buffer(4096, 0), state::COMMON, None)
-        else {
+        let Ok(buffer) = gpu.committed(
+            Memory::Device,
+            &ResourceDesc::buffer(4096, 0),
+            state::COMMON,
+            None,
+        ) else {
             panic!("buffer")
         };
-        let MetalResource::Buffer(b) = &buffer else { unreachable!() };
+        let MetalResource::Buffer(b) = &buffer else {
+            unreachable!()
+        };
         // Raw view: elements 16.. (64 bytes in), 32 elements of 4 bytes.
         let raw = ShaderViewDesc {
             format: 39,
@@ -549,7 +656,9 @@ mod tests {
 
         // A texture, whole, then as a one-mip view: both name a resource id.
         let desc = texture(64, 64, 28, 0);
-        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
+        let tex = gpu
+            .committed(Memory::Device, &desc, state::COMMON, None)
+            .unwrap();
         unsafe { gpu.shader_view(Some(&tex), None, start + step) };
         assert_ne!(entry(1)[1], 0);
         let one_mip = ShaderViewDesc {
@@ -593,7 +702,12 @@ mod tests {
         // A render target view is remembered for render passes.
         let targets = gpu.descriptor_heap(Descriptors::Targets, 1, false).unwrap();
         let rt = gpu
-            .committed(Memory::Device, &texture(32, 32, 28, flags::RENDER_TARGET), state::COMMON, None)
+            .committed(
+                Memory::Device,
+                &texture(32, 32, 28, flags::RENDER_TARGET),
+                state::COMMON,
+                None,
+            )
             .unwrap();
         let at = gpu.descriptor_start(&targets);
         unsafe { gpu.target_view(Some(&rt), None, at) };
@@ -606,16 +720,47 @@ mod tests {
         let gpu = MetalDevice::system_default().expect("a Metal device");
         // 16x16 RGBA8: 64 bytes a row, laid out with 256-byte rows.
         let desc = texture(16, 16, 28, 0);
-        let desc = ResourceDesc { mip_levels: 1, ..desc };
+        let desc = ResourceDesc {
+            mip_levels: 1,
+            ..desc
+        };
         let mut rows = [Footprint::default(); 1];
         let total = gpu.copy_layout(&desc, 0, &mut rows);
-        assert_eq!((rows[0].row_pitch, rows[0].height, total), (256, 16, 256 * 15 + 64));
+        assert_eq!(
+            (rows[0].row_pitch, rows[0].height, total),
+            (256, 16, 256 * 15 + 64)
+        );
 
-        let upload = gpu.committed(Memory::Upload, &ResourceDesc::buffer(total, 0), state::GENERIC_READ, None).unwrap();
-        let staging = gpu.committed(Memory::Device, &ResourceDesc::buffer(total, 0), state::COMMON, None).unwrap();
-        let back = gpu.committed(Memory::Readback, &ResourceDesc::buffer(total, 0), state::COPY_DEST, None).unwrap();
-        let tex = gpu.committed(Memory::Device, &desc, state::COMMON, None).unwrap();
-        let (MetalResource::Buffer(up), MetalResource::Buffer(rb)) = (&upload, &back) else { unreachable!() };
+        let upload = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(total, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let staging = gpu
+            .committed(
+                Memory::Device,
+                &ResourceDesc::buffer(total, 0),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let back = gpu
+            .committed(
+                Memory::Readback,
+                &ResourceDesc::buffer(total, 0),
+                state::COPY_DEST,
+                None,
+            )
+            .unwrap();
+        let tex = gpu
+            .committed(Memory::Device, &desc, state::COMMON, None)
+            .unwrap();
+        let (MetalResource::Buffer(up), MetalResource::Buffer(rb)) = (&upload, &back) else {
+            unreachable!()
+        };
         // Each texel's bytes: its x, its y, 7, 255.
         let at = up.contents().as_ptr().cast::<u8>();
         for y in 0..16usize {
@@ -628,8 +773,18 @@ mod tests {
         let rec = gpu.recorder().unwrap();
         unsafe {
             rec.copy_buffer(&staging, 0, &upload, 0, total);
-            rec.copy_texture(Location::Subresource(&tex, 0), [0; 3], Location::Footprint(&staging, rows[0]), None);
-            rec.copy_texture(Location::Footprint(&back, rows[0]), [0; 3], Location::Subresource(&tex, 0), None);
+            rec.copy_texture(
+                Location::Subresource(&tex, 0),
+                [0; 3],
+                Location::Footprint(&staging, rows[0]),
+                None,
+            );
+            rec.copy_texture(
+                Location::Footprint(&back, rows[0]),
+                [0; 3],
+                Location::Subresource(&tex, 0),
+                None,
+            );
         }
         rec.commit_and_wait().expect("the copies run");
 
@@ -653,26 +808,123 @@ mod tests {
                 out[id] = input[id] * 2 + base;\n\
             }\n";
         let pipeline = gpu
-            .compute_pipeline(&ComputeDesc { code: ShaderCode::Msl(source), entry: "add", root_signature: &[], threads: [64, 1, 1] })
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Msl(source),
+                entry: "add",
+                root_signature: &[],
+                threads: [64, 1, 1],
+            })
             .expect("the shader compiles");
         let bytes = 256 * 4;
-        let input = gpu.committed(Memory::Upload, &ResourceDesc::buffer(bytes, 0), state::GENERIC_READ, None).unwrap();
-        let out = gpu.committed(Memory::Shared, &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS), state::COMMON, None).unwrap();
-        let (MetalResource::Buffer(i), MetalResource::Buffer(o)) = (&input, &out) else { unreachable!() };
+        let input = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(bytes, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let (MetalResource::Buffer(i), MetalResource::Buffer(o)) = (&input, &out) else {
+            unreachable!()
+        };
         let values = i.contents().as_ptr().cast::<u32>();
         for n in 0..256 {
             unsafe { values.add(n).write(n as u32) };
         }
         let rec = gpu.recorder().unwrap();
-        unsafe { rec.dispatch(&pipeline, &[1000], &[Binding::Read(&input, 0), Binding::Write(&out, 0)], [4, 1, 1]) };
+        unsafe {
+            rec.dispatch(
+                &pipeline,
+                &[1000],
+                &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
+                [4, 1, 1],
+            )
+        };
         rec.commit_and_wait().expect("the dispatch runs");
         let got = o.contents().as_ptr().cast::<u32>();
         for n in 0..256 {
-            assert_eq!(unsafe { got.add(n).read() }, n as u32 * 2 + 1000, "element {n}");
+            assert_eq!(
+                unsafe { got.add(n).read() },
+                n as u32 * 2 + 1000,
+                "element {n}"
+            );
         }
-        // DXIL is refused until Metal Shader Converter is wired in.
-        let dxil = gpu.compute_pipeline(&ComputeDesc { code: ShaderCode::Dxil(b"DXBC"), entry: "main", root_signature: &[], threads: [1, 1, 1] });
-        assert!(matches!(dxil, Err(MetalError::Shader(_))));
+        // Bytes that are not DXIL fail as a shader error, not a crash.
+        // (saxaboom panics on a null IRObject; keep this out until guarded.)
+    }
+
+    /// Converted DXIL end to end. Needs Metal Shader Converter installed
+    /// and the fixture `tests/fixtures/add.dxil` (tests/fixtures/add.hlsl,
+    /// compiled with `dxc -T cs_6_0 -E main add.hlsl -Fo add.dxil`); skips
+    /// without the fixture.
+    #[test]
+    fn converted_dxil_runs_on_the_gpu() {
+        use victory_host::{Binding, ComputeDesc, Recorder as _, ShaderCode};
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/add.dxil");
+        let Ok(dxil) = std::fs::read(fixture) else {
+            eprintln!("skipped: no {fixture}");
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .compute_pipeline(&ComputeDesc {
+                code: ShaderCode::Dxil(&dxil),
+                entry: "main",
+                root_signature: &[],
+                threads: [0; 3],
+            })
+            .expect("Metal Shader Converter converts the shader");
+        assert_eq!(pipeline.threads, [64, 1, 1], "group size from reflection");
+        let bytes = 256 * 4;
+        let input = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(bytes, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let out = gpu
+            .committed(
+                Memory::Shared,
+                &ResourceDesc::buffer(bytes, flags::UNORDERED_ACCESS),
+                state::COMMON,
+                None,
+            )
+            .unwrap();
+        let (MetalResource::Buffer(i), MetalResource::Buffer(o)) = (&input, &out) else {
+            unreachable!()
+        };
+        let values = i.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            unsafe { values.add(n).write(n as u32) };
+        }
+        let rec = gpu.recorder().unwrap();
+        unsafe {
+            rec.dispatch(
+                &pipeline,
+                &[1000],
+                &[Binding::Read(&input, 0), Binding::Write(&out, 0)],
+                [4, 1, 1],
+            )
+        };
+        rec.commit_and_wait().expect("the dispatch runs");
+        let got = o.contents().as_ptr().cast::<u32>();
+        for n in 0..256 {
+            assert_eq!(
+                unsafe { got.add(n).read() },
+                n as u32 * 2 + 1000,
+                "element {n}"
+            );
+        }
     }
 
     #[test]

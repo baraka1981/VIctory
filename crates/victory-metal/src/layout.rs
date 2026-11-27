@@ -26,10 +26,13 @@ pub struct Footprint {
 pub(crate) fn mips(desc: &ResourceDesc) -> u32 {
     match desc.mip_levels {
         0 => {
-            let largest = desc.width.max(u64::from(desc.height)).max(match desc.dimension {
-                dimension::TEXTURE_3D => u64::from(desc.depth_or_array_size),
-                _ => 1,
-            });
+            let largest = desc
+                .width
+                .max(u64::from(desc.height))
+                .max(match desc.dimension {
+                    dimension::TEXTURE_3D => u64::from(desc.depth_or_array_size),
+                    _ => 1,
+                });
             64 - largest.max(1).leading_zeros()
         }
         n => u32::from(n),
@@ -50,7 +53,13 @@ fn planes(format: u32) -> u32 {
 pub fn footprint(desc: &ResourceDesc, index: u32, offset: u64) -> Option<Footprint> {
     let offset = offset.next_multiple_of(PLACEMENT_ALIGNMENT);
     if desc.dimension == dimension::BUFFER {
-        return Some(Footprint { offset, row_pitch: desc.width, rows: 1, row_bytes: desc.width, depth: 1 });
+        return Some(Footprint {
+            offset,
+            row_pitch: desc.width,
+            rows: 1,
+            row_bytes: desc.width,
+            depth: 1,
+        });
     }
     let mips = mips(desc);
     let slices = match desc.dimension {
@@ -111,7 +120,11 @@ pub fn layout(desc: &ResourceDesc, first: u32, out: &mut [Placed]) -> Option<u64
         let index = first + i as u32;
         let f = footprint(desc, index, next)?;
         let mip = index % mips(desc);
-        let block = console_block(desc.format).unwrap_or(crate::format::Block { bytes: 1, width: 1, height: 1 });
+        let block = console_block(desc.format).unwrap_or(crate::format::Block {
+            bytes: 1,
+            width: 1,
+            height: 1,
+        });
         *slot = Placed {
             offset: f.offset,
             format: desc.format,
@@ -199,8 +212,14 @@ mod tests {
         let d = texture(256, 256, 28, 2);
         let mut out = [Placed::default(); 2];
         assert_eq!(layout(&d, 0, &mut out), copyable_bytes(&d, 0, 2));
-        assert_eq!((out[0].offset, out[0].width, out[0].height, out[0].row_pitch), (0, 256, 256, 1024));
-        assert_eq!((out[1].offset, out[1].width, out[1].height, out[1].row_pitch), (262_144, 128, 128, 512));
+        assert_eq!(
+            (out[0].offset, out[0].width, out[0].height, out[0].row_pitch),
+            (0, 256, 256, 1024)
+        );
+        assert_eq!(
+            (out[1].offset, out[1].width, out[1].height, out[1].row_pitch),
+            (262_144, 128, 128, 512)
+        );
         // BC: widths and heights round up to whole blocks.
         let mut bc = [Placed::default(); 1];
         layout(&texture(6, 6, 71, 1), 0, &mut bc);

@@ -281,6 +281,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -481,6 +491,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "saxaboom"
+version = "0.2.0+irconverter-2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894c03e685d809fd12cf188fbe1fa13ee649f8e7401a4ec12f8a3402b0b4e444"
+dependencies = [
+ "libloading",
+ "thiserror",
 ]
 
 [[package]]
@@ -834,6 +854,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-metal",
+ "saxaboom",
  "victory-host",
 ]
 

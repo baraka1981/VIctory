@@ -10,14 +10,13 @@ use std::cell::RefCell;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLComputeCommandEncoder,
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLOrigin, MTLSize,
-    MTLTexture,
+    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
+    MTLComputeCommandEncoder, MTLOrigin, MTLResourceUsage, MTLSize, MTLTexture,
 };
 use victory_host::{Barrier, Binding, Location, Recorder, Region};
 
 use crate::MetalError;
-use crate::device::{MetalPipeline, MetalResource};
+use crate::device::{Abi, MetalPipeline, MetalResource};
 use crate::format::console_block;
 
 type Encoder = Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>;
@@ -30,7 +29,10 @@ pub struct MetalRecorder {
 
 impl MetalRecorder {
     pub(crate) fn new(buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>) -> MetalRecorder {
-        MetalRecorder { buffer, blit: RefCell::new(None) }
+        MetalRecorder {
+            buffer,
+            blit: RefCell::new(None),
+        }
     }
 
     fn end(&self) {
@@ -97,7 +99,11 @@ fn level_size(t: &ProtocolObject<dyn MTLTexture>, level: usize) -> MTLSize {
 fn span(region: Option<&Region>, whole: MTLSize) -> (MTLOrigin, MTLSize) {
     match region {
         Some(r) => (
-            MTLOrigin { x: r.left as usize, y: r.top as usize, z: r.front as usize },
+            MTLOrigin {
+                x: r.left as usize,
+                y: r.top as usize,
+                z: r.front as usize,
+            },
             MTLSize {
                 width: r.right.saturating_sub(r.left) as usize,
                 height: r.bottom.saturating_sub(r.top) as usize,
@@ -122,20 +128,58 @@ impl Recorder for MetalRecorder {
         groups: [u32; 3],
     ) {
         self.end();
-        let Some(enc) = self.buffer.computeCommandEncoder() else { return };
+        let Some(enc) = self.buffer.computeCommandEncoder() else {
+            return;
+        };
         enc.setComputePipelineState(&pipeline.state);
         // SAFETY: the constants outlive the call (Metal copies them); the
         // caller keeps bindings inside their buffers.
-        unsafe {
-            if let Some(first) = constants.first() {
-                enc.setBytes_length_atIndex(std::ptr::NonNull::from(first).cast(), constants.len() * 4, 0);
+        if pipeline.abi == Abi::Converted {
+            let addresses: Vec<u64> = bindings
+                .iter()
+                .map(|b| {
+                    let (Binding::Read(r, offset) | Binding::Write(r, offset)) = *b;
+                    buffer(r).map_or(0, |b| b.gpuAddress() + offset)
+                })
+                .collect();
+            let table = crate::irconverter::argument_buffer(constants, &addresses);
+            unsafe {
+                enc.setBytes_length_atIndex(
+                    std::ptr::NonNull::from(&table[0]).cast(),
+                    table.len(),
+                    crate::irconverter::ARGUMENT_BUFFER_INDEX,
+                );
             }
-            for (i, b) in bindings.iter().enumerate() {
-                let (Binding::Read(r, offset) | Binding::Write(r, offset)) = *b;
-                enc.setBuffer_offset_atIndex(buffer(r), offset as usize, i + 1);
+            // Buffers reached only through addresses must be made resident.
+            for b in bindings {
+                let (usage, r) = match *b {
+                    Binding::Read(r, _) => (MTLResourceUsage::Read, r),
+                    Binding::Write(r, _) => (MTLResourceUsage::Read | MTLResourceUsage::Write, r),
+                };
+                if let Some(buf) = buffer(r) {
+                    enc.useResource_usage(ProtocolObject::from_ref(buf), usage);
+                }
+            }
+        } else {
+            unsafe {
+                if let Some(first) = constants.first() {
+                    enc.setBytes_length_atIndex(
+                        std::ptr::NonNull::from(first).cast(),
+                        constants.len() * 4,
+                        0,
+                    );
+                }
+                for (i, b) in bindings.iter().enumerate() {
+                    let (Binding::Read(r, offset) | Binding::Write(r, offset)) = *b;
+                    enc.setBuffer_offset_atIndex(buffer(r), offset as usize, i + 1);
+                }
             }
         }
-        let size = |v: [u32; 3]| MTLSize { width: v[0] as usize, height: v[1] as usize, depth: v[2] as usize };
+        let size = |v: [u32; 3]| MTLSize {
+            width: v[0] as usize,
+            height: v[1] as usize,
+            depth: v[2] as usize,
+        };
         enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(pipeline.threads));
         enc.endEncoding();
     }
@@ -146,8 +190,17 @@ impl Recorder for MetalRecorder {
         }
     }
 
-    unsafe fn copy_buffer(&self, to: &MetalResource, to_offset: u64, from: &MetalResource, from_offset: u64, bytes: u64) {
-        let (Some(to), Some(from), Some(blit)) = (buffer(to), buffer(from), self.blit()) else { return };
+    unsafe fn copy_buffer(
+        &self,
+        to: &MetalResource,
+        to_offset: u64,
+        from: &MetalResource,
+        from_offset: u64,
+        bytes: u64,
+    ) {
+        let (Some(to), Some(from), Some(blit)) = (buffer(to), buffer(from), self.blit()) else {
+            return;
+        };
         // SAFETY: the caller keeps both ranges inside the buffers.
         unsafe {
             blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
@@ -165,10 +218,20 @@ impl Recorder for MetalRecorder {
         match (to, from) {
             (MetalResource::Buffer(t), MetalResource::Buffer(f)) => {
                 // SAFETY: same-shaped buffers (the caller's).
-                unsafe { blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(f, 0, t, 0, f.length().min(t.length())) }
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        f,
+                        0,
+                        t,
+                        0,
+                        f.length().min(t.length()),
+                    )
+                }
             }
             // SAFETY: same-shaped textures (the caller's).
-            (MetalResource::Texture(t), MetalResource::Texture(f)) => unsafe { blit.copyFromTexture_toTexture(f, t) },
+            (MetalResource::Texture(t), MetalResource::Texture(f)) => unsafe {
+                blit.copyFromTexture_toTexture(f, t)
+            },
             _ => {}
         }
     }
@@ -181,17 +244,28 @@ impl Recorder for MetalRecorder {
         region: Option<&Region>,
     ) {
         let Some(blit) = self.blit() else { return };
-        let origin = MTLOrigin { x: at[0] as usize, y: at[1] as usize, z: at[2] as usize };
+        let origin = MTLOrigin {
+            x: at[0] as usize,
+            y: at[1] as usize,
+            z: at[2] as usize,
+        };
         match (to, from) {
             // Buffer footprint -> texture subresource.
             (Location::Subresource(t, index), Location::Footprint(b, f)) => {
-                let (Some(t), Some(b)) = (texture(t), buffer(b)) else { return };
+                let (Some(t), Some(b)) = (texture(t), buffer(b)) else {
+                    return;
+                };
                 let (slice, level) = place(t, index);
-                let whole = MTLSize { width: f.width as usize, height: f.height as usize, depth: f.depth as usize };
+                let whole = MTLSize {
+                    width: f.width as usize,
+                    height: f.height as usize,
+                    depth: f.depth as usize,
+                };
                 let (start, size) = span(region, whole);
                 let block = console_block(f.format).map_or(1, |b| b.height) as usize;
                 let image = f.row_pitch as usize * (f.height as usize).div_ceil(block);
-                let offset = f.offset as usize + start.z * image + start.y / block * f.row_pitch as usize;
+                let offset =
+                    f.offset as usize + start.z * image + start.y / block * f.row_pitch as usize;
                 // SAFETY: the caller's footprint lies inside the buffer.
                 unsafe {
                     blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
@@ -201,12 +275,15 @@ impl Recorder for MetalRecorder {
             }
             // Texture subresource -> buffer footprint.
             (Location::Footprint(b, f), Location::Subresource(t, index)) => {
-                let (Some(t), Some(b)) = (texture(t), buffer(b)) else { return };
+                let (Some(t), Some(b)) = (texture(t), buffer(b)) else {
+                    return;
+                };
                 let (slice, level) = place(t, index);
                 let (start, size) = span(region, level_size(t, level));
                 let block = console_block(f.format).map_or(1, |b| b.height) as usize;
                 let image = f.row_pitch as usize * (f.height as usize).div_ceil(block);
-                let offset = f.offset as usize + origin.z * image + origin.y / block * f.row_pitch as usize;
+                let offset =
+                    f.offset as usize + origin.z * image + origin.y / block * f.row_pitch as usize;
                 // SAFETY: as above.
                 unsafe {
                     blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
@@ -216,7 +293,9 @@ impl Recorder for MetalRecorder {
             }
             // Texture -> texture.
             (Location::Subresource(t, to_index), Location::Subresource(f, from_index)) => {
-                let (Some(t), Some(f)) = (texture(t), texture(f)) else { return };
+                let (Some(t), Some(f)) = (texture(t), texture(f)) else {
+                    return;
+                };
                 let (to_slice, to_level) = place(t, to_index);
                 let (from_slice, from_level) = place(f, from_index);
                 let (start, size) = span(region, level_size(f, from_level));
