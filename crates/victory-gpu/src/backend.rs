@@ -5,7 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
-    Binding, ComputeDesc, ShaderCode, Table,
+    Arguments, Binding, ComputeDesc, Draw, Geometry, GraphicsDesc, Pass, ShaderCode, Table, Vertices,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -269,26 +269,26 @@ pub(crate) struct D3d12Pipeline {
 #[derive(Clone, Copy)]
 pub(crate) struct D3d12List<'a>(pub(crate) &'a ID3D12GraphicsCommandList);
 
-impl Recorder for D3d12List<'_> {
-    type Resource = ID3D12Resource;
-    type Pipeline = D3d12Pipeline;
-    type DescriptorHeap = ID3D12DescriptorHeap;
-
-    unsafe fn dispatch(
+impl D3d12List<'_> {
+    /// Sets the root signature's arguments as `ComputeDesc` says: walking
+    /// its parameters, constants take the next constants, root
+    /// descriptors the next binding, tables the next table (their heaps
+    /// set first). `graphics`: on the graphics root signature.
+    ///
+    /// # Safety
+    /// The open list, live resources and heaps, ranges inside them.
+    unsafe fn root_arguments(
         &self,
         pipeline: &D3d12Pipeline,
         constants: &[u32],
         bindings: &[Binding<'_, ID3D12Resource>],
         tables: &[Table<'_, ID3D12DescriptorHeap>],
-        groups: [u32; 3],
+        graphics: bool,
     ) {
         use victory_host::root::{Kind, parameter};
-        // SAFETY: the caller's open list, live resources and ranges;
-        // arguments go where the root signature's parameters say
-        // (ComputeDesc).
+        let l = self.0;
+        // SAFETY: the caller's.
         unsafe {
-            self.0.SetComputeRootSignature(&pipeline.root);
-            self.0.SetPipelineState(&pipeline.state);
             // The tables' heaps (one view heap, one sampler heap at most).
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::new();
             for t in tables {
@@ -297,7 +297,7 @@ impl Recorder for D3d12List<'_> {
                 }
             }
             if !heaps.is_empty() {
-                self.0.SetDescriptorHeaps(&heaps);
+                l.SetDescriptorHeaps(&heaps);
             }
             let (mut constants, mut bindings, mut tables) = (constants, bindings.iter(), tables.iter());
             for (i, p) in pipeline.parameters.iter().enumerate() {
@@ -306,7 +306,12 @@ impl Recorder for D3d12List<'_> {
                     Kind::Constants { count, .. } => {
                         let n = (count as usize).min(constants.len());
                         if n > 0 {
-                            self.0.SetComputeRoot32BitConstants(i, n as u32, constants.as_ptr().cast(), 0);
+                            let data = constants.as_ptr().cast();
+                            if graphics {
+                                l.SetGraphicsRoot32BitConstants(i, n as u32, data, 0);
+                            } else {
+                                l.SetComputeRoot32BitConstants(i, n as u32, data, 0);
+                            }
                         }
                         constants = &constants[n..];
                     }
@@ -315,10 +320,13 @@ impl Recorder for D3d12List<'_> {
                             continue;
                         };
                         let address = r.GetGPUVirtualAddress() + offset;
-                        match kind {
-                            parameter::CBV => self.0.SetComputeRootConstantBufferView(i, address),
-                            parameter::SRV => self.0.SetComputeRootShaderResourceView(i, address),
-                            _ => self.0.SetComputeRootUnorderedAccessView(i, address),
+                        match (kind, graphics) {
+                            (parameter::CBV, false) => l.SetComputeRootConstantBufferView(i, address),
+                            (parameter::SRV, false) => l.SetComputeRootShaderResourceView(i, address),
+                            (_, false) => l.SetComputeRootUnorderedAccessView(i, address),
+                            (parameter::CBV, true) => l.SetGraphicsRootConstantBufferView(i, address),
+                            (parameter::SRV, true) => l.SetGraphicsRootShaderResourceView(i, address),
+                            (_, true) => l.SetGraphicsRootUnorderedAccessView(i, address),
                         }
                     }
                     Kind::Table(_) => {
@@ -331,11 +339,154 @@ impl Recorder for D3d12List<'_> {
                         let step = device.GetDescriptorHandleIncrementSize(t.heap.GetDesc().Type);
                         let mut handle = t.heap.GetGPUDescriptorHandleForHeapStart();
                         handle.ptr += u64::from(t.first) * u64::from(step);
-                        self.0.SetComputeRootDescriptorTable(i, handle);
+                        if graphics {
+                            l.SetGraphicsRootDescriptorTable(i, handle);
+                        } else {
+                            l.SetComputeRootDescriptorTable(i, handle);
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Targets (cleared first when asked), viewport and scissor.
+    ///
+    /// # Safety
+    /// The open list; the slots hold live views.
+    unsafe fn pass(&self, pass: &Pass<'_>) {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL, D3D12_VIEWPORT,
+        };
+        let l = self.0;
+        let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> =
+            pass.targets.iter().map(|t| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: t.at }).collect();
+        let dsv = pass.depth.map(|d| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: d.at });
+        // SAFETY: the caller's.
+        unsafe {
+            l.OMSetRenderTargets(
+                rtvs.len() as u32,
+                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(|d| d as *const _),
+            );
+            for (t, h) in pass.targets.iter().zip(&rtvs) {
+                if let Some(c) = t.clear {
+                    l.ClearRenderTargetView(*h, &c, None);
+                }
+            }
+            if let (Some(d), Some(h)) = (pass.depth, dsv)
+                && let Some((depth, stencil)) = d.clear
+            {
+                l.ClearDepthStencilView(h, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depth, stencil, None);
+            }
+            let v = pass.viewport;
+            l.RSSetViewports(&[D3D12_VIEWPORT {
+                TopLeftX: v.x,
+                TopLeftY: v.y,
+                Width: v.width,
+                Height: v.height,
+                MinDepth: v.min_depth,
+                MaxDepth: v.max_depth,
+            }]);
+            let [left, top, right, bottom] = pass.scissor.unwrap_or([
+                v.x.max(0.0) as u32,
+                v.y.max(0.0) as u32,
+                (v.x + v.width).max(0.0) as u32,
+                (v.y + v.height).max(0.0) as u32,
+            ]);
+            l.RSSetScissorRects(&[RECT { left: left as i32, top: top as i32, right: right as i32, bottom: bottom as i32 }]);
+        }
+    }
+}
+
+impl Recorder for D3d12List<'_> {
+    type Resource = ID3D12Resource;
+    type Pipeline = D3d12Pipeline;
+    type GraphicsPipeline = D3d12Pipeline;
+    type DescriptorHeap = ID3D12DescriptorHeap;
+
+    unsafe fn dispatch(
+        &self,
+        pipeline: &D3d12Pipeline,
+        constants: &[u32],
+        bindings: &[Binding<'_, ID3D12Resource>],
+        tables: &[Table<'_, ID3D12DescriptorHeap>],
+        groups: [u32; 3],
+    ) {
+        // SAFETY: the caller's open list, live resources and ranges.
+        unsafe {
+            self.0.SetComputeRootSignature(&pipeline.root);
+            self.0.SetPipelineState(&pipeline.state);
+            self.root_arguments(pipeline, constants, bindings, tables, false);
             self.0.Dispatch(groups[0], groups[1], groups[2]);
+        }
+    }
+
+    unsafe fn draw(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &D3d12Pipeline,
+        arguments: &Arguments<'_, ID3D12Resource, ID3D12DescriptorHeap>,
+        vertices: &Vertices<'_, ID3D12Resource>,
+        draw: &Draw,
+    ) {
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
+        use windows::Win32::Graphics::Direct3D12::{D3D12_INDEX_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW};
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let l = self.0;
+        // SAFETY: the caller's open list, live resources, views and ranges.
+        unsafe {
+            l.SetGraphicsRootSignature(&pipeline.root);
+            l.SetPipelineState(&pipeline.state);
+            self.root_arguments(pipeline, arguments.constants, arguments.bindings, arguments.tables, true);
+            self.pass(pass);
+            l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(vertices.primitive as i32));
+            let size = |r: &ID3D12Resource, offset: u64| r.GetDesc().Width.saturating_sub(offset) as u32;
+            let views: Vec<D3D12_VERTEX_BUFFER_VIEW> = vertices
+                .buffers
+                .iter()
+                .map(|b| D3D12_VERTEX_BUFFER_VIEW {
+                    BufferLocation: b.resource.GetGPUVirtualAddress() + b.offset,
+                    SizeInBytes: size(b.resource, b.offset),
+                    StrideInBytes: b.stride,
+                })
+                .collect();
+            if !views.is_empty() {
+                l.IASetVertexBuffers(0, Some(&views));
+            }
+            match vertices.index {
+                Some(i) => {
+                    l.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
+                        BufferLocation: i.resource.GetGPUVirtualAddress() + i.offset,
+                        SizeInBytes: size(i.resource, i.offset),
+                        Format: DXGI_FORMAT(i.format as i32),
+                    }));
+                    l.DrawIndexedInstanced(draw.count, draw.instances, draw.first, draw.base_vertex, draw.first_instance);
+                }
+                None => l.DrawInstanced(draw.count, draw.instances, draw.first, draw.first_instance),
+            }
+        }
+    }
+
+    unsafe fn draw_mesh(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &D3d12Pipeline,
+        arguments: &Arguments<'_, ID3D12Resource, ID3D12DescriptorHeap>,
+        groups: [u32; 3],
+    ) {
+        use windows::core::Interface;
+        use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList6;
+        // SAFETY: as for draw.
+        unsafe {
+            let Ok(l6) = self.0.cast::<ID3D12GraphicsCommandList6>() else { return };
+            self.0.SetGraphicsRootSignature(&pipeline.root);
+            self.0.SetPipelineState(&pipeline.state);
+            self.root_arguments(pipeline, arguments.constants, arguments.bindings, arguments.tables, true);
+            self.pass(pass);
+            l6.DispatchMesh(groups[0], groups[1], groups[2]);
         }
     }
 
@@ -387,6 +538,7 @@ impl Device for D3d12<'_> {
     type Resource = ID3D12Resource;
     type Heap = ID3D12Heap;
     type Pipeline = D3d12Pipeline;
+    type GraphicsPipeline = D3d12Pipeline;
     type DescriptorHeap = ID3D12DescriptorHeap;
     type Error = windows::core::Error;
 
@@ -547,6 +699,124 @@ impl Device for D3d12<'_> {
                 },
                 ..Default::default()
             })?;
+            Ok(D3d12Pipeline { root, state, parameters })
+        }
+    }
+
+    /// Vertex + pixel pipelines; mesh pipelines (a pipeline state stream)
+    /// are not done on D3D12 yet (`E_NOTIMPL`).
+    fn graphics_pipeline(&self, desc: &GraphicsDesc<'_>) -> windows::core::Result<D3d12Pipeline> {
+        use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_OP, D3D12_COMPARISON_FUNC, D3D12_CULL_MODE,
+            D3D12_DEPTH_STENCIL_DESC, D3D12_DEPTH_WRITE_MASK, D3D12_FILL_MODE,
+            D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, D3D12_INPUT_ELEMENT_DESC,
+            D3D12_INPUT_LAYOUT_DESC, D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_RASTERIZER_DESC,
+            D3D12_RENDER_TARGET_BLEND_DESC,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+        let invalid = || windows::core::Error::from_hresult(E_INVALIDARG);
+        let dxil = |code: ShaderCode<'_>| match code {
+            ShaderCode::Dxil(d) => Ok(D3D12_SHADER_BYTECODE { pShaderBytecode: d.as_ptr().cast(), BytecodeLength: d.len() }),
+            _ => Err(invalid()),
+        };
+        let Geometry::Vertex { shader, inputs } = desc.geometry else {
+            return Err(windows::core::Error::from_hresult(E_NOTIMPL));
+        };
+        let ShaderCode::Dxil(vs) = shader.code else { return Err(invalid()) };
+        // No root signature given: the one embedded in the vertex shader.
+        let blob = if desc.root_signature.is_empty() { vs } else { desc.root_signature };
+        let parameters = victory_host::root::parse(blob)
+            .map_err(|_| invalid())?
+            .parameters
+            .into_iter()
+            .map(|p| p.kind)
+            .collect();
+        let names: Vec<std::ffi::CString> = inputs
+            .iter()
+            .map(|e| std::ffi::CString::new(e.semantic).map_err(|_| invalid()))
+            .collect::<Result<_, _>>()?;
+        let elements: Vec<D3D12_INPUT_ELEMENT_DESC> = inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: windows::core::PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(e.format as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: if e.per_instance {
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                } else {
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                },
+                InstanceDataStepRate: if e.per_instance { e.step_rate } else { 0 },
+            })
+            .collect();
+        let blend = |b: &victory_host::Blend| D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: b.enable.into(),
+            LogicOpEnable: false.into(),
+            SrcBlend: D3D12_BLEND(b.src as i32),
+            DestBlend: D3D12_BLEND(b.dst as i32),
+            BlendOp: D3D12_BLEND_OP(b.op as i32),
+            SrcBlendAlpha: D3D12_BLEND(b.src_alpha as i32),
+            DestBlendAlpha: D3D12_BLEND(b.dst_alpha as i32),
+            BlendOpAlpha: D3D12_BLEND_OP(b.op_alpha as i32),
+            LogicOp: Default::default(),
+            RenderTargetWriteMask: b.write_mask,
+        };
+        let mut formats = [DXGI_FORMAT(0); 8];
+        for (f, &t) in formats.iter_mut().zip(desc.targets) {
+            *f = DXGI_FORMAT(t as i32);
+        }
+        let r = desc.raster;
+        // SAFETY: a serialized root signature (or a DXIL container with
+        // one), DXIL stages and descriptions D3D12 validates; the name
+        // strings outlive the call.
+        unsafe {
+            let root: ID3D12RootSignature = self.0.CreateRootSignature(0, blob)?;
+            let pso = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(&root))),
+                VS: dxil(shader.code)?,
+                PS: match desc.pixel {
+                    Some(p) => dxil(p.code)?,
+                    None => D3D12_SHADER_BYTECODE::default(),
+                },
+                BlendState: D3D12_BLEND_DESC {
+                    AlphaToCoverageEnable: false.into(),
+                    IndependentBlendEnable: true.into(),
+                    RenderTarget: desc.blend.map(|b| blend(&b)),
+                },
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE(r.fill as i32),
+                    CullMode: D3D12_CULL_MODE(r.cull as i32),
+                    FrontCounterClockwise: r.front_ccw.into(),
+                    DepthBias: r.depth_bias,
+                    DepthBiasClamp: r.depth_bias_clamp,
+                    SlopeScaledDepthBias: r.slope_scaled_depth_bias,
+                    DepthClipEnable: r.depth_clip.into(),
+                    ..Default::default()
+                },
+                DepthStencilState: D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: desc.depth.enable.into(),
+                    DepthWriteMask: D3D12_DEPTH_WRITE_MASK(i32::from(desc.depth.write)),
+                    DepthFunc: D3D12_COMPARISON_FUNC(desc.depth.func as i32),
+                    ..Default::default()
+                },
+                InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                    pInputElementDescs: elements.as_ptr(),
+                    NumElements: elements.len() as u32,
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(desc.topology as i32),
+                NumRenderTargets: desc.targets.len().min(8) as u32,
+                RTVFormats: formats,
+                DSVFormat: DXGI_FORMAT(desc.depth_format as i32),
+                SampleDesc: DXGI_SAMPLE_DESC { Count: desc.samples.max(1), Quality: 0 },
+                ..Default::default()
+            };
+            let state: ID3D12PipelineState = self.0.CreateGraphicsPipelineState(&pso)?;
             Ok(D3d12Pipeline { root, state, parameters })
         }
     }

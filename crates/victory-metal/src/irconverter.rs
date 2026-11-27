@@ -372,15 +372,31 @@ pub(crate) fn locations(rs: &RootSignature) -> Result<Vec<ffi::IRResourceLocatio
     Ok(root_signature(rs)?.resource_locations())
 }
 
-/// A converted compute shader.
+/// A converted shader and what its reflection says.
 pub(crate) struct Converted {
     pub metallib: Vec<u8>,
+    pub stage: ffi::IRShaderStage,
+    /// Threads per group (compute, mesh, amplification).
     pub threads: [u32; 3],
+    /// Vertex shaders: (attribute name, stage-in attribute index).
+    pub vertex_inputs: Vec<(String, u32)>,
+    /// Vertex shaders: reads draw parameters (vertex / instance ids),
+    /// bound at `DRAW_ARGUMENTS_INDEX` and `UNIFORMS_INDEX`.
+    pub needs_draw_params: bool,
+    /// Amplification shaders: payload bytes for the mesh stage.
+    pub payload: u32,
 }
 
-/// Converts a DXIL compute shader whose entry point is `entry`, with
+/// MSC's draw parameter buffers (`kIRArgumentBufferDrawArgumentsBindPoint`,
+/// `kIRArgumentBufferUniformsBindPoint`) and first vertex buffer
+/// (`kIRVertexBufferBindPoint`), from metal_irconverter_runtime.h.
+pub(crate) const DRAW_ARGUMENTS_INDEX: usize = 4;
+pub(crate) const UNIFORMS_INDEX: usize = 5;
+pub(crate) const VERTEX_BUFFER_INDEX: usize = 6;
+
+/// Converts a DXIL shader of any stage whose entry point is `entry`, with
 /// `root` as its root signature (the embedded one when `None`).
-pub(crate) fn compute(
+pub(crate) fn convert(
     dxil: &[u8],
     entry: &CStr,
     root: Option<&RootSignature>,
@@ -402,11 +418,61 @@ pub(crate) fn compute(
         .metal_lib_binary()
         .ok_or_else(|| MetalError::Shader("no metallib from Metal Shader Converter".into()))?
         .byte_code();
-    let threads = out
-        .reflection()
-        .and_then(|r| r.compute_info(ffi::IRReflectionVersion::_1_0))
-        // SAFETY: version 1.0 info, as asked for.
-        .map(|info| unsafe { info.u_1.info_1_0.tg_size })
-        .unwrap_or([1, 1, 1]);
-    Ok(Converted { metallib, threads })
+    let stage = out.metal_ir_shader_stage();
+    let mut converted = Converted {
+        metallib,
+        stage,
+        threads: [1, 1, 1],
+        vertex_inputs: Vec::new(),
+        needs_draw_params: false,
+        payload: 0,
+    };
+    let Some(r) = out.reflection() else {
+        return Ok(converted);
+    };
+    let v = ffi::IRReflectionVersion::_1_0;
+    // SAFETY (each union read): version 1.0 info, as asked for; vertex
+    // input names are C strings owned by the info, copied before it goes.
+    match stage {
+        ffi::IRShaderStage::Compute => {
+            if let Some(info) = r.compute_info(v) {
+                converted.threads = unsafe { info.u_1.info_1_0.tg_size };
+            }
+        }
+        ffi::IRShaderStage::Mesh => {
+            if let Some(info) = r.mesh_info(v) {
+                converted.threads = unsafe { info.u_1.info_1_0.num_threads };
+            }
+        }
+        ffi::IRShaderStage::Amplification => {
+            if let Some(info) = r.amplification_info(v) {
+                let i = unsafe { info.u_1.info_1_0 };
+                converted.threads = i.num_threads;
+                converted.payload = i.max_payload_size_in_bytes;
+            }
+        }
+        ffi::IRShaderStage::Vertex => {
+            if let Some(info) = r.vertex_info(v) {
+                let i = unsafe { info.u_1.info_1_0 };
+                converted.needs_draw_params = i.needs_draw_params;
+                if !i.vertex_inputs.is_null() {
+                    let inputs =
+                        unsafe { std::slice::from_raw_parts(i.vertex_inputs, i.num_vertex_inputs) };
+                    converted.vertex_inputs = inputs
+                        .iter()
+                        .filter(|x| !x.name.is_null())
+                        .map(|x| {
+                            let name = unsafe { CStr::from_ptr(x.name) };
+                            (
+                                name.to_string_lossy().into_owned(),
+                                u32::from(x.attributeIndex),
+                            )
+                        })
+                        .collect();
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(converted)
 }

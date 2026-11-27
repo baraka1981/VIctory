@@ -11,18 +11,34 @@ use std::sync::Arc;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
-    MTLComputeCommandEncoder, MTLHeap, MTLOrigin, MTLResource, MTLResourceUsage, MTLSize,
-    MTLTexture,
+    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder,
+    MTLComputeCommandEncoder, MTLCullMode, MTLDepthClipMode, MTLHeap, MTLIndexType,
+    MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType, MTLRenderCommandEncoder,
+    MTLRenderPassAttachmentDescriptor, MTLRenderPassDescriptor, MTLRenderStages, MTLResource,
+    MTLResourceUsage, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
+    MTLTriangleFillMode, MTLViewport, MTLWinding,
 };
-use victory_host::{Barrier, Binding, Location, Recorder, Region, Table};
+use victory_host::{
+    Arguments, Barrier, Binding, Draw, Location, Pass, Recorder, Region, Table, Vertices,
+};
 
 use crate::device::{Abi, MetalDescriptorHeap, MetalPipeline, MetalResource};
-use crate::views::{Resident, Slots};
+use crate::render::{Kind, MetalGraphicsPipeline};
+use crate::toplevel::TopLevel;
+use crate::views::{Resident, Slots, Target};
 use crate::{DESCRIPTOR_BYTES, MetalError};
 use crate::format::console_block;
 
 type Encoder = Retained<ProtocolObject<dyn MTLBlitCommandEncoder>>;
+type RenderEncoder = Retained<ProtocolObject<dyn MTLRenderCommandEncoder>>;
+
+/// What one dispatch or draw makes resident.
+#[derive(Default)]
+struct Residency {
+    heaps: Vec<Retained<ProtocolObject<dyn MTLHeap>>>,
+    /// Resources outside heaps, and whether any use writes them.
+    loose: Vec<(Retained<ProtocolObject<dyn MTLResource>>, bool)>,
+}
 
 /// An open command buffer.
 pub struct MetalRecorder {
@@ -49,68 +65,235 @@ impl MetalRecorder {
     /// descriptors the root signature's ranges cover name. Those placed in
     /// a heap go resident a heap at a time (`useHeap`), the rest one by one
     /// (`useResource`, read-write for unordered access views).
-    fn make_resident(
+    fn residency(
         &self,
-        enc: &ProtocolObject<dyn MTLComputeCommandEncoder>,
-        pipeline: &MetalPipeline,
+        top: &TopLevel,
         bindings: &[Binding<'_, MetalResource>],
         tables: &[Table<'_, MetalDescriptorHeap>],
-    ) {
-        let read = MTLResourceUsage::Read;
-        let write = MTLResourceUsage::Read | MTLResourceUsage::Write;
+    ) -> Residency {
+        let mut out = Residency::default();
+        let mut add = |resource: Retained<ProtocolObject<dyn MTLResource>>, writes: bool| {
+            if let Some(h) = resource.heap() {
+                if !out.heaps.iter().any(|x| Retained::as_ptr(x) == Retained::as_ptr(&h)) {
+                    out.heaps.push(h);
+                }
+                return;
+            }
+            match out
+                .loose
+                .iter_mut()
+                .find(|(x, _)| Retained::as_ptr(x) == Retained::as_ptr(&resource))
+            {
+                Some((_, w)) => *w |= writes,
+                None => out.loose.push((resource, writes)),
+            }
+        };
         for b in bindings {
-            let (usage, r) = match *b {
-                Binding::Read(r, _) => (read, r),
-                Binding::Write(r, _) => (write, r),
+            let (writes, r) = match *b {
+                Binding::Read(r, _) => (false, r),
+                Binding::Write(r, _) => (true, r),
             };
-            if let Some(buf) = buffer(r) {
-                enc.useResource_usage(ProtocolObject::from_ref(buf), usage);
+            if let MetalResource::Buffer(buf) = r {
+                add(ProtocolObject::from_retained(buf.clone()), writes);
             }
         }
         let mut named = Vec::new();
         for (k, t) in tables.iter().enumerate() {
-            enc.useResource_usage(ProtocolObject::from_ref(&*t.heap.table), read);
+            add(ProtocolObject::from_retained(t.heap.table.clone()), false);
             let base = t.heap.table.contents().as_ptr() as usize;
             let step = DESCRIPTOR_BYTES as usize;
-            for run in pipeline.top.reached(k, t.first, t.heap.count) {
+            for run in top.reached(k, t.first, t.heap.count) {
                 self.slots.resident(
                     base + run.start as usize * step..base + run.end as usize * step,
                     &mut named,
                 );
             }
         }
-        // One call per heap, and per resource outside heaps (the
-        // strongest usage it is named with).
-        let mut heaps: Vec<Retained<ProtocolObject<dyn MTLHeap>>> = Vec::new();
-        let mut loose: Vec<(Retained<ProtocolObject<dyn MTLResource>>, bool)> = Vec::new();
         for (r, writes) in named {
             let resource: Retained<ProtocolObject<dyn MTLResource>> = match r {
                 Resident::Buffer(b) => ProtocolObject::from_retained(b),
-                Resident::Texture(t) => {
-                    // A view's memory is its parent's.
-                    let t = t.parentTexture().unwrap_or(t);
-                    ProtocolObject::from_retained(t)
-                }
+                // A view's memory is its parent's.
+                Resident::Texture(t) => ProtocolObject::from_retained(t.parentTexture().unwrap_or(t)),
             };
-            if let Some(h) = resource.heap() {
-                if !heaps.iter().any(|x| Retained::as_ptr(x) == Retained::as_ptr(&h)) {
-                    heaps.push(h);
+            add(resource, writes);
+        }
+        out
+    }
+
+    /// A render encoder for `pass` (its targets loaded or cleared, then
+    /// stored), and the first target's size for clamping the scissor.
+    fn render_encoder(&self, pass: &Pass<'_>) -> Option<(RenderEncoder, (usize, usize))> {
+        self.end();
+        let d = MTLRenderPassDescriptor::new();
+        let mut size = (usize::MAX, usize::MAX);
+        let mut place = |a: &MTLRenderPassAttachmentDescriptor, t: &Target| {
+            a.setTexture(Some(&t.texture));
+            a.setLevel(t.level);
+            if t.texture.textureType() == MTLTextureType::Type3D {
+                a.setDepthPlane(t.slice);
+            } else {
+                a.setSlice(t.slice);
+            }
+            a.setStoreAction(MTLStoreAction::Store);
+            size = (
+                size.0.min((t.texture.width() >> t.level).max(1)),
+                size.1.min((t.texture.height() >> t.level).max(1)),
+            );
+        };
+        for (i, at) in pass.targets.iter().enumerate() {
+            let Some(t) = self.slots.target(at.at) else { continue };
+            // SAFETY: at most 8 targets.
+            let a = unsafe { d.colorAttachments().objectAtIndexedSubscript(i) };
+            place(&a, &t);
+            match at.clear {
+                Some([r, g, b, alpha]) => {
+                    a.setLoadAction(MTLLoadAction::Clear);
+                    a.setClearColor(MTLClearColor {
+                        red: f64::from(r),
+                        green: f64::from(g),
+                        blue: f64::from(b),
+                        alpha: f64::from(alpha),
+                    });
                 }
-                continue;
-            }
-            match loose
-                .iter_mut()
-                .find(|(x, _)| Retained::as_ptr(x) == Retained::as_ptr(&resource))
-            {
-                Some((_, w)) => *w |= writes,
-                None => loose.push((resource, writes)),
+                None => a.setLoadAction(MTLLoadAction::Load),
             }
         }
-        for h in &heaps {
-            enc.useHeap(h);
+        if let Some(at) = pass.depth
+            && let Some(t) = self.slots.target(at.at)
+        {
+            let a = d.depthAttachment();
+            place(&a, &t);
+            let stencil = matches!(
+                t.texture.pixelFormat(),
+                MTLPixelFormat::Depth32Float_Stencil8 | MTLPixelFormat::X32_Stencil8
+            );
+            let s = d.stencilAttachment();
+            if stencil {
+                place(&s, &t);
+            }
+            match at.clear {
+                Some((depth, st)) => {
+                    a.setLoadAction(MTLLoadAction::Clear);
+                    a.setClearDepth(f64::from(depth));
+                    s.setLoadAction(MTLLoadAction::Clear);
+                    s.setClearStencil(u32::from(st));
+                }
+                None => {
+                    a.setLoadAction(MTLLoadAction::Load);
+                    s.setLoadAction(MTLLoadAction::Load);
+                }
+            }
         }
-        for (r, writes) in &loose {
-            enc.useResource_usage(r, if *writes { write } else { read });
+        let enc = self.buffer.renderCommandEncoderWithDescriptor(&d)?;
+        Some((enc, size))
+    }
+
+    /// Pipeline, fixed-function state, the top-level argument buffer on
+    /// the pipeline's stages, and residency.
+    fn render_state(
+        &self,
+        enc: &ProtocolObject<dyn MTLRenderCommandEncoder>,
+        size: (usize, usize),
+        pass: &Pass<'_>,
+        pipeline: &MetalGraphicsPipeline,
+        args: &Arguments<'_, MetalResource, MetalDescriptorHeap>,
+    ) {
+        enc.setRenderPipelineState(&pipeline.state);
+        enc.setDepthStencilState(Some(&pipeline.depth));
+        let r = &pipeline.raster;
+        enc.setCullMode(match r.cull {
+            2 => MTLCullMode::Front,
+            3 => MTLCullMode::Back,
+            _ => MTLCullMode::None,
+        });
+        enc.setFrontFacingWinding(if r.front_ccw {
+            MTLWinding::CounterClockwise
+        } else {
+            MTLWinding::Clockwise
+        });
+        enc.setTriangleFillMode(if r.fill == 2 {
+            MTLTriangleFillMode::Lines
+        } else {
+            MTLTriangleFillMode::Fill
+        });
+        enc.setDepthClipMode(if r.depth_clip {
+            MTLDepthClipMode::Clip
+        } else {
+            MTLDepthClipMode::Clamp
+        });
+        enc.setDepthBias_slopeScale_clamp(
+            r.depth_bias as f32,
+            r.slope_scaled_depth_bias,
+            r.depth_bias_clamp,
+        );
+        let v = pass.viewport;
+        enc.setViewport(MTLViewport {
+            originX: f64::from(v.x),
+            originY: f64::from(v.y),
+            width: f64::from(v.width),
+            height: f64::from(v.height),
+            znear: f64::from(v.min_depth),
+            zfar: f64::from(v.max_depth),
+        });
+        let [left, top, right, bottom] = pass.scissor.unwrap_or([
+            v.x.max(0.0) as u32,
+            v.y.max(0.0) as u32,
+            (v.x + v.width).max(0.0) as u32,
+            (v.y + v.height).max(0.0) as u32,
+        ]);
+        // Metal refuses scissors outside the attachments.
+        let (w, h) = size;
+        let x = (left as usize).min(w);
+        let y = (top as usize).min(h);
+        enc.setScissorRect(MTLScissorRect {
+            x,
+            y,
+            width: (right as usize).min(w).saturating_sub(x),
+            height: (bottom as usize).min(h).saturating_sub(y),
+        });
+        let addresses: Vec<u64> = args
+            .bindings
+            .iter()
+            .map(|b| {
+                let (Binding::Read(r, offset) | Binding::Write(r, offset)) = *b;
+                buffer(r).map_or(0, |b| b.gpuAddress() + offset)
+            })
+            .collect();
+        let starts: Vec<u64> = args
+            .tables
+            .iter()
+            .map(|t| t.heap.table.gpuAddress() + u64::from(t.first) * u64::from(DESCRIPTOR_BYTES))
+            .collect();
+        let top = pipeline.top.fill(args.constants, &addresses, &starts);
+        let stages = pipeline.stages;
+        let bytes = std::ptr::NonNull::from(&top[0]).cast();
+        let index = crate::irconverter::ARGUMENT_BUFFER_INDEX;
+        // SAFETY: Metal copies the bytes.
+        unsafe {
+            if stages.contains(MTLRenderStages::Vertex) {
+                enc.setVertexBytes_length_atIndex(bytes, top.len(), index);
+            }
+            if stages.contains(MTLRenderStages::Object) {
+                enc.setObjectBytes_length_atIndex(bytes, top.len(), index);
+            }
+            if stages.contains(MTLRenderStages::Mesh) {
+                enc.setMeshBytes_length_atIndex(bytes, top.len(), index);
+            }
+            if stages.contains(MTLRenderStages::Fragment) {
+                enc.setFragmentBytes_length_atIndex(bytes, top.len(), index);
+            }
+        }
+        let residency = self.residency(&pipeline.top, args.bindings, args.tables);
+        for h in &residency.heaps {
+            enc.useHeap_stages(h, stages);
+        }
+        for (r, writes) in &residency.loose {
+            let usage = if *writes {
+                MTLResourceUsage::Read | MTLResourceUsage::Write
+            } else {
+                MTLResourceUsage::Read
+            };
+            enc.useResource_usage_stages(r, usage, stages);
         }
     }
 
@@ -196,6 +379,7 @@ fn span(region: Option<&Region>, whole: MTLSize) -> (MTLOrigin, MTLSize) {
 impl Recorder for MetalRecorder {
     type Resource = MetalResource;
     type Pipeline = MetalPipeline;
+    type GraphicsPipeline = MetalGraphicsPipeline;
     type DescriptorHeap = MetalDescriptorHeap;
 
     /// One compute encoder per dispatch. Converted DXIL: the top-level
@@ -238,7 +422,18 @@ impl Recorder for MetalRecorder {
                     crate::irconverter::ARGUMENT_BUFFER_INDEX,
                 );
             }
-            self.make_resident(&enc, pipeline, bindings, tables);
+            let residency = self.residency(&pipeline.top, bindings, tables);
+            for h in &residency.heaps {
+                enc.useHeap(h);
+            }
+            for (r, writes) in &residency.loose {
+                let usage = if *writes {
+                    MTLResourceUsage::Read | MTLResourceUsage::Write
+                } else {
+                    MTLResourceUsage::Read
+                };
+                enc.useResource_usage(r, usage);
+            }
         } else {
             unsafe {
                 if let Some(first) = constants.first() {
@@ -260,6 +455,139 @@ impl Recorder for MetalRecorder {
             depth: v[2] as usize,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(pipeline.threads));
+        enc.endEncoding();
+    }
+
+    /// One render encoder per draw (targets loaded or cleared, stored).
+    unsafe fn draw(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &MetalGraphicsPipeline,
+        arguments: &Arguments<'_, MetalResource, MetalDescriptorHeap>,
+        vertices: &Vertices<'_, MetalResource>,
+        draw: &Draw,
+    ) {
+        let Some((enc, size)) = self.render_encoder(pass) else {
+            return;
+        };
+        self.render_state(&enc, size, pass, pipeline, arguments);
+        // SAFETY: the caller keeps buffers live and covering the draw.
+        unsafe {
+            for (slot, vb) in vertices.buffers.iter().enumerate() {
+                enc.setVertexBuffer_offset_attributeStride_atIndex(
+                    buffer(vb.resource),
+                    vb.offset as usize,
+                    vb.stride as usize,
+                    crate::irconverter::VERTEX_BUFFER_INDEX + slot,
+                );
+            }
+        }
+        let primitive = match vertices.primitive {
+            1 => MTLPrimitiveType::Point,
+            2 => MTLPrimitiveType::Line,
+            3 => MTLPrimitiveType::LineStrip,
+            5 => MTLPrimitiveType::TriangleStrip,
+            _ => MTLPrimitiveType::Triangle,
+        };
+        let draw_params = matches!(pipeline.kind, Kind::Vertex { draw_params: true });
+        let index = vertices
+            .index
+            .and_then(|i| buffer(i.resource).map(|b| (b, i.offset, i.format)));
+        // SAFETY: as above; MSC's draw parameter layouts (runtime header):
+        // IRRuntimeDrawArgument / IRRuntimeDrawIndexedArgument at the draw
+        // argument index, the index type (0: none, else MTLIndexType + 1)
+        // as a u16 at the uniforms index.
+        unsafe {
+            match index {
+                None => {
+                    if draw_params {
+                        let args = [draw.count, draw.instances, draw.first, draw.first_instance];
+                        enc.setVertexBytes_length_atIndex(
+                            std::ptr::NonNull::from(&args).cast(),
+                            size_of_val(&args),
+                            crate::irconverter::DRAW_ARGUMENTS_INDEX,
+                        );
+                        let none = 0u16;
+                        enc.setVertexBytes_length_atIndex(
+                            std::ptr::NonNull::from(&none).cast(),
+                            2,
+                            crate::irconverter::UNIFORMS_INDEX,
+                        );
+                    }
+                    enc.drawPrimitives_vertexStart_vertexCount_instanceCount_baseInstance(
+                        primitive,
+                        draw.first as usize,
+                        draw.count as usize,
+                        draw.instances as usize,
+                        draw.first_instance as usize,
+                    );
+                }
+                Some((ib, offset, format)) => {
+                    let (kind, bytes) = if format == 57 {
+                        (MTLIndexType::UInt16, 2)
+                    } else {
+                        (MTLIndexType::UInt32, 4)
+                    };
+                    if draw_params {
+                        let args: [u32; 5] = [
+                            draw.count,
+                            draw.instances,
+                            draw.first,
+                            draw.base_vertex as u32,
+                            draw.first_instance,
+                        ];
+                        enc.setVertexBytes_length_atIndex(
+                            std::ptr::NonNull::from(&args).cast(),
+                            size_of_val(&args),
+                            crate::irconverter::DRAW_ARGUMENTS_INDEX,
+                        );
+                        let ir = kind.0 as u16 + 1;
+                        enc.setVertexBytes_length_atIndex(
+                            std::ptr::NonNull::from(&ir).cast(),
+                            2,
+                            crate::irconverter::UNIFORMS_INDEX,
+                        );
+                    }
+                    enc.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                        primitive,
+                        draw.count as usize,
+                        kind,
+                        ib,
+                        offset as usize + draw.first as usize * bytes,
+                        draw.instances as usize,
+                        draw.base_vertex as isize,
+                        draw.first_instance as usize,
+                    );
+                }
+            }
+        }
+        enc.endEncoding();
+    }
+
+    unsafe fn draw_mesh(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &MetalGraphicsPipeline,
+        arguments: &Arguments<'_, MetalResource, MetalDescriptorHeap>,
+        groups: [u32; 3],
+    ) {
+        let Kind::Mesh { object, mesh, .. } = pipeline.kind else {
+            return;
+        };
+        let Some((enc, size)) = self.render_encoder(pass) else {
+            return;
+        };
+        self.render_state(&enc, size, pass, pipeline, arguments);
+        let size = |v: [u32; 3]| MTLSize {
+            width: v[0] as usize,
+            height: v[1] as usize,
+            depth: v[2] as usize,
+        };
+        enc.drawMeshThreadgroups_threadsPerObjectThreadgroup_threadsPerMeshThreadgroup(
+            size(groups),
+            size(object),
+            size(mesh),
+        );
         enc.endEncoding();
     }
 

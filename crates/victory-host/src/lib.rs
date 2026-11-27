@@ -9,8 +9,9 @@
 //! format numbers are D3D12.X's (D3D12's numbering, DXGI formats plus the
 //! console's own). D3D12 passes them through; other backends translate.
 //!
-//! Slice 1 covers resource creation and descriptor heaps. Views, pipelines
-//! and command recording follow (docs/metal-port.md).
+//! Covered so far: resources and heaps, descriptor heaps and views,
+//! barriers and copies, compute and graphics pipelines with D3D12 root
+//! signatures ([`root`]), dispatches and draws (docs/metal-port.md).
 
 use core::fmt;
 
@@ -336,6 +337,248 @@ pub struct ComputeDesc<'a> {
     pub threads: [u32; 3],
 }
 
+/// One shader stage: code and entry point.
+#[derive(Debug, Clone, Copy)]
+pub struct Stage<'a> {
+    pub code: ShaderCode<'a>,
+    /// Entry point name (Metal; D3D12 takes the container's).
+    pub entry: &'a str,
+}
+
+/// `InputElement::offset`: right after the slot's previous element.
+pub const APPEND_ALIGNED: u32 = u32::MAX;
+
+/// One vertex attribute (`D3D12_INPUT_ELEMENT_DESC`). Strides are not
+/// here: they come with the vertex buffers at draw time, as in D3D12.
+#[derive(Debug, Clone, Copy)]
+pub struct InputElement<'a> {
+    /// HLSL semantic name without the index ("POSITION", "TEXCOORD").
+    pub semantic: &'a str,
+    pub index: u32,
+    /// DXGI format number.
+    pub format: u32,
+    /// Vertex buffer slot.
+    pub slot: u32,
+    /// Bytes into the vertex, or [`APPEND_ALIGNED`].
+    pub offset: u32,
+    /// Per instance (advancing every `step_rate` instances) instead of
+    /// per vertex.
+    pub per_instance: bool,
+    pub step_rate: u32,
+}
+
+/// Where a graphics pipeline's primitives come from.
+#[derive(Debug, Clone, Copy)]
+pub enum Geometry<'a> {
+    /// The input assembler and a vertex shader.
+    Vertex {
+        shader: Stage<'a>,
+        inputs: &'a [InputElement<'a>],
+    },
+    /// A mesh shader, optionally fed by an amplification shader.
+    Mesh {
+        amplification: Option<Stage<'a>>,
+        shader: Stage<'a>,
+    },
+}
+
+/// One render target's blending (`D3D12_RENDER_TARGET_BLEND_DESC`, D3D12's
+/// `D3D12_BLEND` / `D3D12_BLEND_OP` numbers; no logic ops).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blend {
+    pub enable: bool,
+    pub src: u32,
+    pub dst: u32,
+    pub op: u32,
+    pub src_alpha: u32,
+    pub dst_alpha: u32,
+    pub op_alpha: u32,
+    /// D3D12's bits: red 1, green 2, blue 4, alpha 8.
+    pub write_mask: u8,
+}
+
+impl Blend {
+    /// Blending off, every channel written.
+    pub const OPAQUE: Blend = Blend {
+        enable: false,
+        src: 2,
+        dst: 1,
+        op: 1,
+        src_alpha: 2,
+        dst_alpha: 1,
+        op_alpha: 1,
+        write_mask: 0xf,
+    };
+}
+
+/// Rasterizer state (`D3D12_RASTERIZER_DESC`'s fields the backends use;
+/// D3D12 numbers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Raster {
+    /// `D3D12_FILL_MODE`: 2 wireframe, 3 solid.
+    pub fill: u32,
+    /// `D3D12_CULL_MODE`: 1 none, 2 front, 3 back.
+    pub cull: u32,
+    pub front_ccw: bool,
+    pub depth_bias: i32,
+    pub depth_bias_clamp: f32,
+    pub slope_scaled_depth_bias: f32,
+    pub depth_clip: bool,
+}
+
+impl Raster {
+    /// D3D12's defaults: solid, back faces culled, clockwise front.
+    pub const DEFAULT: Raster = Raster {
+        fill: 3,
+        cull: 3,
+        front_ccw: false,
+        depth_bias: 0,
+        depth_bias_clamp: 0.0,
+        slope_scaled_depth_bias: 0.0,
+        depth_clip: true,
+    };
+}
+
+/// Depth testing (stencil: later).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DepthTest {
+    pub enable: bool,
+    pub write: bool,
+    /// `D3D12_COMPARISON_FUNC`: 1 never .. 8 always.
+    pub func: u32,
+}
+
+impl DepthTest {
+    pub const OFF: DepthTest = DepthTest {
+        enable: false,
+        write: false,
+        func: 8,
+    };
+}
+
+/// A graphics pipeline. Root signature as for [`ComputeDesc`] (empty:
+/// the one embedded in the vertex or mesh shader); its arguments at draw
+/// time go the same way.
+#[derive(Debug, Clone, Copy)]
+pub struct GraphicsDesc<'a> {
+    pub geometry: Geometry<'a>,
+    pub pixel: Option<Stage<'a>>,
+    pub root_signature: &'a [u8],
+    /// Render target formats (DXGI numbers), in order.
+    pub targets: &'a [u32],
+    /// Depth-stencil format, 0 for none.
+    pub depth_format: u32,
+    pub samples: u32,
+    /// `D3D12_PRIMITIVE_TOPOLOGY_TYPE`: 1 point, 2 line, 3 triangle.
+    pub topology: u32,
+    /// One per target (the rest ignored).
+    pub blend: [Blend; 8],
+    pub raster: Raster,
+    pub depth: DepthTest,
+}
+
+/// The arguments the root signature takes, for a draw.
+#[derive(Debug)]
+pub struct Arguments<'a, R, H> {
+    pub constants: &'a [u32],
+    pub bindings: &'a [Binding<'a, R>],
+    pub tables: &'a [Table<'a, H>],
+}
+
+impl<R, H> Clone for Arguments<'_, R, H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R, H> Copy for Arguments<'_, R, H> {}
+
+/// A render target for a draw: a target view slot (as written by
+/// [`Device::target_view`]), cleared to `clear` first when given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Attachment {
+    pub at: usize,
+    pub clear: Option<[f32; 4]>,
+}
+
+/// The depth-stencil target: a depth view slot, cleared to (depth,
+/// stencil) first when given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthAttachment {
+    pub at: usize,
+    pub clear: Option<(f32, u8)>,
+}
+
+/// Where a draw renders (`D3D12_VIEWPORT`, top-left origin).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub min_depth: f32,
+    pub max_depth: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pass<'a> {
+    pub targets: &'a [Attachment],
+    pub depth: Option<DepthAttachment>,
+    pub viewport: Viewport,
+    /// left, top, right, bottom; the viewport's bounds when `None`.
+    pub scissor: Option<[u32; 4]>,
+}
+
+/// A vertex buffer for one slot.
+#[derive(Debug)]
+pub struct VertexBuffer<'a, R> {
+    pub resource: &'a R,
+    pub offset: u64,
+    pub stride: u32,
+}
+
+/// An index buffer: `format` is DXGI's R16_UINT (57) or R32_UINT (42).
+#[derive(Debug)]
+pub struct IndexBuffer<'a, R> {
+    pub resource: &'a R,
+    pub offset: u64,
+    pub format: u32,
+}
+
+impl<R> Clone for VertexBuffer<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for VertexBuffer<'_, R> {}
+impl<R> Clone for IndexBuffer<'_, R> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<R> Copy for IndexBuffer<'_, R> {}
+
+/// What the input assembler reads.
+#[derive(Debug)]
+pub struct Vertices<'a, R> {
+    /// One per slot, from slot 0.
+    pub buffers: &'a [VertexBuffer<'a, R>],
+    pub index: Option<IndexBuffer<'a, R>>,
+    /// `D3D_PRIMITIVE_TOPOLOGY`: 1 points, 2 lines, 3 line strip,
+    /// 4 triangles, 5 triangle strip.
+    pub primitive: u32,
+}
+
+/// A draw's counts (`DrawInstanced` / `DrawIndexedInstanced`): `first` is
+/// the first vertex, or the first index when indexed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Draw {
+    pub count: u32,
+    pub instances: u32,
+    pub first: u32,
+    pub base_vertex: i32,
+    pub first_instance: u32,
+}
+
 /// A buffer bound for a dispatch.
 #[derive(Debug)]
 pub enum Binding<'a, R> {
@@ -388,6 +631,7 @@ impl<R> Copy for Barrier<'_, R> {}
 pub trait Recorder {
     type Resource;
     type Pipeline;
+    type GraphicsPipeline;
     type DescriptorHeap;
 
     /// Runs `pipeline` over `groups` thread groups with `constants`,
@@ -403,6 +647,33 @@ pub trait Recorder {
         constants: &[u32],
         bindings: &[Binding<'_, Self::Resource>],
         tables: &[Table<'_, Self::DescriptorHeap>],
+        groups: [u32; 3],
+    );
+
+    /// Draws with `pipeline` into `pass`'s targets.
+    ///
+    /// # Safety
+    /// As for [`Recorder::dispatch`]; the target slots hold live views,
+    /// and vertex and index buffers cover what the draw reads.
+    unsafe fn draw(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &Self::GraphicsPipeline,
+        arguments: &Arguments<'_, Self::Resource, Self::DescriptorHeap>,
+        vertices: &Vertices<'_, Self::Resource>,
+        draw: &Draw,
+    );
+
+    /// Runs a mesh pipeline over `groups` (amplification groups when it
+    /// has an amplification shader, else mesh groups) into `pass`.
+    ///
+    /// # Safety
+    /// As for [`Recorder::draw`].
+    unsafe fn draw_mesh(
+        &self,
+        pass: &Pass<'_>,
+        pipeline: &Self::GraphicsPipeline,
+        arguments: &Arguments<'_, Self::Resource, Self::DescriptorHeap>,
         groups: [u32; 3],
     );
 
@@ -457,6 +728,8 @@ pub trait Device {
     type DescriptorHeap;
     /// A compiled compute pipeline.
     type Pipeline;
+    /// A compiled graphics pipeline.
+    type GraphicsPipeline;
     type Error: fmt::Display + fmt::Debug;
 
     /// A resource with memory of its own, in `state` (D3D12 numbering),
@@ -575,8 +848,14 @@ pub trait Device {
         at: usize,
     );
 
-    /// A compute pipeline (slice 3a's binding model, [`ComputeDesc`]).
+    /// A compute pipeline ([`ComputeDesc`]).
     fn compute_pipeline(&self, desc: &ComputeDesc<'_>) -> Result<Self::Pipeline, Self::Error>;
+
+    /// A graphics pipeline ([`GraphicsDesc`]).
+    fn graphics_pipeline(
+        &self,
+        desc: &GraphicsDesc<'_>,
+    ) -> Result<Self::GraphicsPipeline, Self::Error>;
 
     /// Copy footprints of subresources `first..first + count` of `desc`,
     /// one per entry of `out` (its length is `count`), placed from offset

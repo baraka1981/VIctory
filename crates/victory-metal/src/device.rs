@@ -12,7 +12,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::{
     MTLBuffer, MTLCommandQueue, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
-    MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLLibrary, MTLPixelFormat, MTLResourceOptions,
+    MTLFunction, MTLHeap, MTLHeapDescriptor, MTLHeapType, MTLLibrary, MTLPixelFormat, MTLResourceOptions,
     MTLSamplerState, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
     MTLTextureUsage,
 };
@@ -23,6 +23,7 @@ use victory_host::{
 };
 
 use crate::record::MetalRecorder;
+use crate::render::MetalGraphicsPipeline;
 use crate::toplevel::TopLevel;
 use crate::views::{self, Kept, Slots, Target, resource_id};
 use crate::{DESCRIPTOR_BYTES, MetalError, format, layout};
@@ -144,6 +145,40 @@ impl MetalDevice {
         b.load()
     }
 
+    /// Function `entry` of a library made from MSL source or a metallib.
+    pub(crate) fn function(
+        &self,
+        code: ShaderCode<'_>,
+        entry: &str,
+    ) -> Result<Retained<ProtocolObject<dyn MTLFunction>>, MetalError> {
+        let shader = |e: Retained<objc2_foundation::NSError>| {
+            MetalError::Shader(e.localizedDescription().to_string())
+        };
+        let library: Retained<ProtocolObject<dyn MTLLibrary>> = match code {
+            ShaderCode::Msl(source) => self
+                .device
+                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
+                .map_err(shader)?,
+            ShaderCode::MetalLib(bytes) => {
+                // Metal reads libraries from files or dispatch data; a file
+                // keeps this free of libdispatch bindings.
+                let path =
+                    std::env::temp_dir().join(format!("victory-{:x}.metallib", fxhash(bytes)));
+                std::fs::write(&path, bytes).map_err(|e| MetalError::Shader(e.to_string()))?;
+                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
+                let made = self.device.newLibraryWithURL_error(&url).map_err(shader);
+                let _ = std::fs::remove_file(&path);
+                made?
+            }
+            ShaderCode::Dxil(_) => {
+                return Err(MetalError::Shader("DXIL needs converting first".into()));
+            }
+        };
+        library
+            .newFunctionWithName(&NSString::from_str(entry))
+            .ok_or_else(|| MetalError::Shader(format!("no function {entry}")))
+    }
+
     fn texture_entry(
         texture: Option<Retained<ProtocolObject<dyn MTLTexture>>>,
     ) -> ([u64; 3], Option<Kept>) {
@@ -156,6 +191,32 @@ impl MetalDevice {
             None => ([0; 3], None),
         }
     }
+}
+
+/// The root signature a converted pipeline uses: the one handed in, else
+/// the one embedded in `dxil`; and whether it was handed in.
+pub(crate) fn root_signature_for(
+    given: &[u8],
+    dxil: &[u8],
+) -> Result<(victory_host::root::RootSignature, bool), MetalError> {
+    let blob = if given.is_empty() {
+        victory_host::root::embedded(dxil).ok_or_else(|| {
+            MetalError::Shader("no root signature: none given, none embedded".into())
+        })?
+    } else {
+        given
+    };
+    let rs = victory_host::root::parse(blob).map_err(|e| MetalError::Shader(e.to_string()))?;
+    Ok((rs, !given.is_empty()))
+}
+
+pub(crate) fn c_entry(entry: &str) -> Result<std::ffi::CString, MetalError> {
+    std::ffi::CString::new(entry).map_err(|e| MetalError::Shader(e.to_string()))
+}
+
+/// The Metal function name converted shaders have.
+pub(crate) fn converted_entry() -> &'static str {
+    crate::irconverter::ENTRY.to_str().unwrap_or("victory_main")
 }
 
 /// A short hash for temporary file names.
@@ -248,6 +309,7 @@ impl Device for MetalDevice {
     type Heap = Heap;
     type DescriptorHeap = MetalDescriptorHeap;
     type Pipeline = MetalPipeline;
+    type GraphicsPipeline = MetalGraphicsPipeline;
     type Error = MetalError;
 
     fn committed(
@@ -391,55 +453,21 @@ impl Device for MetalDevice {
         let shader = |e: Retained<objc2_foundation::NSError>| {
             MetalError::Shader(e.localizedDescription().to_string())
         };
-        let mut abi = Abi::Direct;
-        let mut threads = desc.threads;
-        let mut top = TopLevel::default();
-        let converted;
-        let mut code = desc.code;
-        if let ShaderCode::Dxil(dxil) = code {
-            let entry = std::ffi::CString::new(desc.entry)
-                .map_err(|e| MetalError::Shader(e.to_string()))?;
-            let given = !desc.root_signature.is_empty();
-            let blob = if given {
-                desc.root_signature
-            } else {
-                victory_host::root::embedded(dxil).ok_or_else(|| {
-                    MetalError::Shader("no root signature: none given, none embedded".into())
-                })?
-            };
-            let rs = victory_host::root::parse(blob)
-                .map_err(|e| MetalError::Shader(e.to_string()))?;
-            converted = crate::irconverter::compute(dxil, &entry, given.then_some(&rs))?;
-            threads = converted.threads;
-            top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
-            abi = Abi::Converted;
-            code = ShaderCode::MetalLib(&converted.metallib);
-        }
-        let entry = match abi {
-            Abi::Converted => crate::irconverter::ENTRY.to_str().unwrap_or("victory_main"),
-            Abi::Direct => desc.entry,
-        };
-        let library: Retained<ProtocolObject<dyn MTLLibrary>> = match code {
-            ShaderCode::Msl(source) => self
-                .device
-                .newLibraryWithSource_options_error(&NSString::from_str(source), None)
-                .map_err(shader)?,
-            ShaderCode::MetalLib(bytes) => {
-                // Metal reads libraries from files or dispatch data; a file
-                // keeps this free of libdispatch bindings.
-                let path =
-                    std::env::temp_dir().join(format!("victory-{:x}.metallib", fxhash(bytes)));
-                std::fs::write(&path, bytes).map_err(|e| MetalError::Shader(e.to_string()))?;
-                let url = NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()));
-                let made = self.device.newLibraryWithURL_error(&url).map_err(shader);
-                let _ = std::fs::remove_file(&path);
-                made?
+        let (function, threads, abi, top) = match desc.code {
+            ShaderCode::Dxil(dxil) => {
+                let (rs, given) = root_signature_for(desc.root_signature, dxil)?;
+                let c = crate::irconverter::convert(dxil, &c_entry(desc.entry)?, given.then_some(&rs))?;
+                let top = TopLevel::new(&rs).map_err(|e| MetalError::Shader(e.to_string()))?;
+                let function = self.function(ShaderCode::MetalLib(&c.metallib), converted_entry())?;
+                (function, c.threads, Abi::Converted, top)
             }
-            ShaderCode::Dxil(_) => unreachable!("converted above"),
+            code => (
+                self.function(code, desc.entry)?,
+                desc.threads,
+                Abi::Direct,
+                TopLevel::default(),
+            ),
         };
-        let function = library
-            .newFunctionWithName(&NSString::from_str(entry))
-            .ok_or_else(|| MetalError::Shader(format!("no function {entry}")))?;
         let state = self
             .device
             .newComputePipelineStateWithFunction_error(&function)
@@ -450,6 +478,13 @@ impl Device for MetalDevice {
             abi,
             top,
         })
+    }
+
+    fn graphics_pipeline(
+        &self,
+        desc: &victory_host::GraphicsDesc<'_>,
+    ) -> Result<MetalGraphicsPipeline, MetalError> {
+        crate::render::pipeline(self, desc)
     }
 
     fn copy_layout(
@@ -1168,6 +1203,323 @@ mod tests {
                 n as u32 * 5 + 1000,
                 "element {n}"
             );
+        }
+    }
+
+    fn fixture(name: &str) -> Option<Vec<u8>> {
+        let path = format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        let got = std::fs::read(&path).ok();
+        if got.is_none() {
+            eprintln!("skipped: no {path}");
+        }
+        got
+    }
+
+    /// An 8x8 RGBA8 render target: `record` draws into it (given the RTV
+    /// slot), then it is read back as rows of pixels.
+    fn render_8x8(
+        gpu: &MetalDevice,
+        record: impl FnOnce(&MetalRecorder, usize),
+    ) -> Vec<[u8; 4]> {
+        use victory_host::{Location, Recorder as _};
+        let desc = texture(8, 8, 28, flags::RENDER_TARGET);
+        let target = gpu
+            .committed(Memory::Device, &desc, state::COMMON, None)
+            .unwrap();
+        let rtvs = gpu.descriptor_heap(Descriptors::Targets, 1, false).unwrap();
+        let at = gpu.descriptor_start(&rtvs);
+        unsafe { gpu.target_view(Some(&target), None, at) };
+        let mut fp = [victory_host::Footprint::default()];
+        let bytes = gpu.copy_layout(&desc, 0, &mut fp);
+        let back = gpu
+            .committed(
+                Memory::Readback,
+                &ResourceDesc::buffer(bytes, 0),
+                state::COPY_DEST,
+                None,
+            )
+            .unwrap();
+        let rec = gpu.recorder().unwrap();
+        record(&rec, at);
+        unsafe {
+            rec.copy_texture(
+                Location::Footprint(&back, fp[0]),
+                [0, 0, 0],
+                Location::Subresource(&target, 0),
+                None,
+            )
+        };
+        rec.commit_and_wait().expect("the draws run");
+        let MetalResource::Buffer(b) = &back else {
+            unreachable!()
+        };
+        let base = b.contents().as_ptr().cast::<u8>();
+        let mut out = Vec::new();
+        for y in 0..8 {
+            for x in 0..8 {
+                let p = unsafe { base.add(fp[0].row_pitch as usize * y + x * 4) };
+                out.push(unsafe { [p.read(), p.add(1).read(), p.add(2).read(), p.add(3).read()] });
+            }
+        }
+        out
+    }
+
+    fn colour(rgba: [f32; 4]) -> [u32; 4] {
+        rgba.map(f32::to_bits)
+    }
+
+    fn whole_8x8(at: usize, clear: Option<[f32; 4]>) -> victory_host::Pass<'static> {
+        // Leaked: a test's few bytes, so the pass can be 'static.
+        let targets = Box::leak(Box::new([victory_host::Attachment { at, clear }]));
+        victory_host::Pass {
+            targets,
+            depth: None,
+            viewport: victory_host::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: 8.0,
+                height: 8.0,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            },
+            scissor: None,
+        }
+    }
+
+    fn upload(gpu: &MetalDevice, words: &[u32]) -> MetalResource {
+        let r = gpu
+            .committed(
+                Memory::Upload,
+                &ResourceDesc::buffer(words.len() as u64 * 4, 0),
+                state::GENERIC_READ,
+                None,
+            )
+            .unwrap();
+        let MetalResource::Buffer(b) = &r else {
+            unreachable!()
+        };
+        let p = b.contents().as_ptr().cast::<u32>();
+        for (i, w) in words.iter().enumerate() {
+            unsafe { p.add(i).write(*w) };
+        }
+        r
+    }
+
+    /// Vertex + pixel through the seam: a cleared target, the left half
+    /// drawn red from a vertex buffer, then the right half green with an
+    /// index buffer (loading what is there). Needs Metal Shader Converter
+    /// and quad_vs.dxil / quad_ps.dxil.
+    #[test]
+    fn vertex_pixel_pipeline_draws() {
+        use victory_host::{
+            APPEND_ALIGNED, Arguments, Blend, DepthTest, Draw, Geometry, GraphicsDesc, IndexBuffer,
+            InputElement, Raster, Recorder as _, ShaderCode, Stage, VertexBuffer, Vertices,
+        };
+        let (Some(vs), Some(ps)) = (fixture("quad_vs.dxil"), fixture("quad_ps.dxil")) else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let inputs = [InputElement {
+            semantic: "POSITION",
+            index: 0,
+            format: 16, // R32G32_FLOAT
+            slot: 0,
+            offset: APPEND_ALIGNED,
+            per_instance: false,
+            step_rate: 0,
+        }];
+        let pipeline = gpu
+            .graphics_pipeline(&GraphicsDesc {
+                geometry: Geometry::Vertex {
+                    shader: Stage {
+                        code: ShaderCode::Dxil(&vs),
+                        entry: "main",
+                    },
+                    inputs: &inputs,
+                },
+                pixel: Some(Stage {
+                    code: ShaderCode::Dxil(&ps),
+                    entry: "main",
+                }),
+                root_signature: &[],
+                targets: &[28],
+                depth_format: 0,
+                samples: 1,
+                topology: 3,
+                blend: [Blend::OPAQUE; 8],
+                raster: Raster {
+                    cull: 1,
+                    ..Raster::DEFAULT
+                },
+                depth: DepthTest::OFF,
+            })
+            .expect("Metal Shader Converter converts both stages");
+        let f = |v: f32| v.to_bits();
+        // Left half: two triangles. Right half: four corners, indexed.
+        let left = upload(
+            &gpu,
+            &[-1.0, -1.0, -1.0, 1.0, 0.0, -1.0, 0.0, -1.0, -1.0, 1.0, 0.0, 1.0].map(f),
+        );
+        let right = upload(&gpu, &[0.0, -1.0, 0.0, 1.0, 1.0, -1.0, 1.0, 1.0].map(f));
+        // u16 indices 0 1 2, 2 1 3, two to a word (low half first).
+        let pair = |a: u32, b: u32| a | (b << 16);
+        let indices = upload(&gpu, &[pair(0, 1), pair(2, 2), pair(1, 3)]);
+        let red = colour([1.0, 0.0, 0.0, 1.0]);
+        let green = colour([0.0, 1.0, 0.0, 1.0]);
+        let pixels = render_8x8(&gpu, |rec, at| unsafe {
+            rec.draw(
+                &whole_8x8(at, Some([0.0, 0.0, 1.0, 1.0])),
+                &pipeline,
+                &Arguments {
+                    constants: &red,
+                    bindings: &[],
+                    tables: &[],
+                },
+                &Vertices {
+                    buffers: &[VertexBuffer {
+                        resource: &left,
+                        offset: 0,
+                        stride: 8,
+                    }],
+                    index: None,
+                    primitive: 4,
+                },
+                &Draw {
+                    count: 6,
+                    instances: 1,
+                    first: 0,
+                    base_vertex: 0,
+                    first_instance: 0,
+                },
+            );
+            rec.draw(
+                &whole_8x8(at, None),
+                &pipeline,
+                &Arguments {
+                    constants: &green,
+                    bindings: &[],
+                    tables: &[],
+                },
+                &Vertices {
+                    buffers: &[VertexBuffer {
+                        resource: &right,
+                        offset: 0,
+                        stride: 8,
+                    }],
+                    index: Some(IndexBuffer {
+                        resource: &indices,
+                        offset: 0,
+                        format: 57, // R16_UINT
+                    }),
+                    primitive: 4,
+                },
+                &Draw {
+                    count: 6,
+                    instances: 1,
+                    first: 0,
+                    base_vertex: 0,
+                    first_instance: 0,
+                },
+            );
+        });
+        assert_eq!(pixels[8 + 1], [255, 0, 0, 255], "left half red");
+        assert_eq!(pixels[5 * 8 + 6], [0, 255, 0, 255], "right half green");
+    }
+
+    /// Mesh + pixel through the seam: one mesh group covers the left
+    /// half red; the right half keeps the clear colour. Needs Metal Shader
+    /// Converter and mesh.dxil / quad_ps.dxil.
+    #[test]
+    fn mesh_pipeline_draws() {
+        use victory_host::{
+            Arguments, Blend, DepthTest, Geometry, GraphicsDesc, Raster, Recorder as _, ShaderCode,
+            Stage,
+        };
+        let (Some(ms), Some(ps)) = (fixture("mesh.dxil"), fixture("quad_ps.dxil")) else {
+            return;
+        };
+        let gpu = MetalDevice::system_default().expect("a Metal device");
+        let pipeline = gpu
+            .graphics_pipeline(&GraphicsDesc {
+                geometry: Geometry::Mesh {
+                    amplification: None,
+                    shader: Stage {
+                        code: ShaderCode::Dxil(&ms),
+                        entry: "main",
+                    },
+                },
+                pixel: Some(Stage {
+                    code: ShaderCode::Dxil(&ps),
+                    entry: "main",
+                }),
+                root_signature: &[],
+                targets: &[28],
+                depth_format: 0,
+                samples: 1,
+                topology: 3,
+                blend: [Blend::OPAQUE; 8],
+                raster: Raster {
+                    cull: 1,
+                    ..Raster::DEFAULT
+                },
+                depth: DepthTest::OFF,
+            })
+            .expect("Metal Shader Converter converts both stages");
+        assert!(matches!(
+            pipeline.kind,
+            crate::render::Kind::Mesh {
+                mesh: [1, 1, 1],
+                amplified: false,
+                ..
+            }
+        ));
+        let red = colour([1.0, 0.0, 0.0, 1.0]);
+        let pixels = render_8x8(&gpu, |rec, at| unsafe {
+            rec.draw_mesh(
+                &whole_8x8(at, Some([0.0, 0.0, 1.0, 1.0])),
+                &pipeline,
+                &Arguments {
+                    constants: &red,
+                    bindings: &[],
+                    tables: &[],
+                },
+                [1, 1, 1],
+            )
+        });
+        assert_eq!(pixels[8 + 1], [255, 0, 0, 255], "left half red");
+        assert_eq!(pixels[5 * 8 + 6], [0, 0, 255, 255], "right half cleared blue");
+    }
+
+    #[test]
+    fn vertex_formats_match_metal() {
+        use objc2_metal::MTLVertexFormat as F;
+        for (dxgi, want) in [
+            (2, F::Float4),
+            (6, F::Float3),
+            (16, F::Float2),
+            (41, F::Float),
+            (10, F::Half4),
+            (34, F::Half2),
+            (54, F::Half),
+            (28, F::UChar4Normalized),
+            (87, F::UChar4Normalized_BGRA),
+            (31, F::Char4Normalized),
+            (24, F::UInt1010102Normalized),
+            (26, F::FloatRG11B10),
+            (67, F::FloatRGB9E5),
+            (42, F::UInt),
+            (3, F::UInt4),
+            (4, F::Int4),
+            (12, F::UShort4),
+            (11, F::UShort4Normalized),
+            (13, F::Short4Normalized),
+            (35, F::UShort2Normalized),
+            (37, F::Short2Normalized),
+            (49, F::UChar2Normalized),
+            (61, F::UCharNormalized),
+            (57, F::UShort),
+        ] {
+            assert_eq!(crate::vertex::format(dxgi).map(|f| f.0), Some(want.0), "DXGI {dxgi}");
         }
     }
 

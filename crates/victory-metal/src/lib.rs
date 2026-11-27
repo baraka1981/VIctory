@@ -18,6 +18,7 @@ use core::fmt;
 pub mod format;
 pub mod layout;
 pub mod toplevel;
+pub mod vertex;
 
 #[cfg(target_os = "macos")]
 mod device;
@@ -26,11 +27,15 @@ mod irconverter;
 #[cfg(target_os = "macos")]
 mod record;
 #[cfg(target_os = "macos")]
+mod render;
+#[cfg(target_os = "macos")]
 mod views;
 #[cfg(target_os = "macos")]
 pub use device::{Abi, MetalDescriptorHeap, MetalDevice, MetalPipeline, MetalResource};
 #[cfg(target_os = "macos")]
 pub use record::MetalRecorder;
+#[cfg(target_os = "macos")]
+pub use render::{Kind as GraphicsKind, MetalGraphicsPipeline};
 #[cfg(target_os = "macos")]
 pub use views::Target;
 
