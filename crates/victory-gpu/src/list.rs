@@ -1230,7 +1230,13 @@ extern "system" fn clear_rtv(
                     State(RENDER_TARGET as i32),
                 )]);
             }
-            list.list.ClearRenderTargetView(rtv, color, rects);
+            use victory_host::Recorder as _;
+            let rects: Vec<victory_host::Rect> = rects
+                .unwrap_or(&[])
+                .iter()
+                .map(|r: &windows::Win32::Foundation::RECT| [r.left, r.top, r.right, r.bottom])
+                .collect();
+            crate::backend::rec(&list.list).clear_target(rtv.ptr, *color, &rects);
         }
     }
     #[cfg(not(windows))]
@@ -1250,7 +1256,6 @@ extern "system" fn clear_dsv(
 ) {
     #[cfg(windows)]
     {
-        use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
             return;
@@ -1274,10 +1279,20 @@ extern "system" fn clear_dsv(
             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+        use victory_host::Recorder as _;
+        let rects: Vec<victory_host::Rect> = rects
+            .unwrap_or(&[])
+            .iter()
+            .map(|r: &windows::Win32::Foundation::RECT| [r.left, r.top, r.right, r.bottom])
+            .collect();
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
-            list.list
-                .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
+            crate::backend::rec(&list.list).clear_depth(
+                dsv.ptr,
+                (flags & 1 != 0).then_some(depth),
+                (flags & 2 != 0).then_some(stencil),
+                &rects,
+            )
         };
     }
     #[cfg(not(windows))]

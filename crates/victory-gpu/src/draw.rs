@@ -15,12 +15,21 @@ use victory_shader::{ResourceType, RootType, UsedResource};
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
-use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::core::Interface;
 
 use crate::host::HostList;
+use victory_host::root::parameter;
+use victory_host::{Point, Recorder as _};
+
+/// The host list as the seam's recorder.
+fn rec(list: &HostList) -> crate::backend::D3d12List<'_> {
+    crate::backend::rec(&list.list)
+}
+
+fn point(compute: bool) -> Point {
+    if compute { Point::Compute } else { Point::Graphics }
+}
 use crate::memory::Writes;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
@@ -659,10 +668,7 @@ impl State {
             t => t,
         };
         // SAFETY: an open list.
-        unsafe {
-            list.list
-                .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY(host as i32))
-        };
+        unsafe { rec(list).set_topology(host) };
     }
 
     pub(crate) fn set_pipeline(&mut self, pipeline: This) {
@@ -787,15 +793,9 @@ impl State {
             crate::capture::note_target(record.resource);
             Some(host.dsv(texture, record.depth_desc().as_ref()))
         });
+        let rtvs: Vec<usize> = rtvs.iter().map(|h| h.ptr).collect();
         // SAFETY: an open list; the views were just made.
-        unsafe {
-            list.list.OMSetRenderTargets(
-                rtvs.len() as u32,
-                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
-                false,
-                dsv.as_ref().map(std::ptr::from_ref),
-            )
-        };
+        unsafe { rec(list).set_targets(&rtvs, dsv.map(|h| h.ptr)) };
     }
 
     /// Viewports, scissors, the blend factor and the stencil reference: set
@@ -1077,7 +1077,6 @@ impl State {
         if !self.bind(list, p, false, false) {
             return false;
         }
-        let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
@@ -1099,10 +1098,14 @@ impl State {
                 StrideInBytes: v.stride,
             };
         }
+        let views: Vec<victory_host::VertexView> = views[..count]
+            .iter()
+            .map(|v| victory_host::VertexView { address: v.BufferLocation, size: v.SizeInBytes, stride: v.StrideInBytes })
+            .collect();
         // SAFETY: an open list; the views name live host buffers.
         unsafe {
             if count > 0 {
-                l.IASetVertexBuffers(0, Some(&views[..count]));
+                rec(list).set_vertex_buffers(0, &views);
             }
         }
         if indexed {
@@ -1111,13 +1114,13 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
-            let view = D3D12_INDEX_BUFFER_VIEW {
-                BufferLocation: shadow.gpu(v.address),
-                SizeInBytes: v.size,
-                Format: DXGI_FORMAT(v.format as i32),
+            let view = victory_host::IndexView {
+                address: shadow.gpu(v.address),
+                size: v.size,
+                format: v.format,
             };
             // SAFETY: an open list; the view names a live host buffer.
-            unsafe { l.IASetIndexBuffer(Some(&view)) };
+            unsafe { rec(list).set_index_buffer(Some(view)) };
         }
         const RENDER_TARGET: u32 = 0x4;
         for &t in &self.targets {
@@ -1161,7 +1164,6 @@ impl State {
         if list.planes_now() {
             self.after_our_pass(list);
         }
-        let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
         if crate::host::walls_trace() {
@@ -1170,16 +1172,17 @@ impl State {
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
-            let heaps: Vec<Option<ID3D12DescriptorHeap>> = self
+            let heaps: Vec<ID3D12DescriptorHeap> = self
                 .heaps
                 .iter()
                 .filter(|&&h| h != 0)
                 .filter_map(|&h| crate::descriptor::heap(h as This).host())
-                .map(|h| Some(h.heap.clone()))
+                .map(|h| h.heap.clone())
                 .collect();
-            heaps.iter().flatten().for_each(|h| list.keep(h));
+            heaps.iter().for_each(|h| list.keep(h));
+            let heaps: Vec<&ID3D12DescriptorHeap> = heaps.iter().collect();
             // SAFETY: an open list and shader-visible heaps.
-            unsafe { l.SetDescriptorHeaps(&heaps) };
+            unsafe { rec(list).set_heaps(&heaps) };
             self.host_heaps = self.heaps;
             self.host_roots = [0; 2];
         }
@@ -1191,28 +1194,34 @@ impl State {
             0
         };
         TESTED_DEPTH.set((tested, false));
-        let root = p.root.as_raw() as usize;
+        let root = p.host.root.as_raw() as usize;
         if self.host_roots[usize::from(compute)] != root {
             // SAFETY: an open list and a live root signature.
             unsafe {
                 if compute {
-                    l.SetComputeRootSignature(&p.root);
+                    rec(list).set_compute_root(&p.host);
                 } else {
-                    l.SetGraphicsRootSignature(&p.root);
+                    rec(list).set_graphics_root(&p.host);
                 }
             }
             self.host_roots[usize::from(compute)] = root;
         }
         // By host object: a title pipeline released and another made at its
         // address is another host pipeline (the list keeps the old one).
-        if self.host_pipeline != p.pso.as_raw() as usize {
+        if self.host_pipeline != p.host.state.as_raw() as usize {
             // SAFETY: an open list and a live pipeline.
-            unsafe { l.SetPipelineState(&p.pso) };
-            self.host_pipeline = p.pso.as_raw() as usize;
+            unsafe {
+                if compute {
+                    rec(list).set_compute_pipeline(&p.host);
+                } else {
+                    rec(list).set_graphics_pipeline(&p.host);
+                }
+            }
+            self.host_pipeline = p.host.state.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            list.keep(&p.host.state);
+            list.keep(&p.host.root);
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1285,13 +1294,7 @@ impl State {
                     crate::material_demand::record(list, heap, *table, record, fields);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
-                unsafe {
-                    if compute {
-                        l.SetComputeRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    } else {
-                        l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
-                    }
-                }
+                unsafe { rec(list).set_root_constants(point(compute), param, 0, &values) };
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
@@ -1300,13 +1303,7 @@ impl State {
                         if let Some(m) = &memory {
                             // SAFETY: an open list; the directory lives as
                             // long as the process and the list holds it.
-                            unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, m.directory);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, m.directory);
-                                }
-                            }
+                            unsafe { rec(list).set_root_view(point(compute), param, parameter::SRV, m.directory) };
                         }
                         continue;
                     }
@@ -1319,11 +1316,7 @@ impl State {
                         // SAFETY: the list keeps this buffer and the root parameter is a raw SRV.
                         unsafe {
                             let address = buffer.GetGPUVirtualAddress();
-                            if compute {
-                                l.SetComputeRootShaderResourceView(param, address);
-                            } else {
-                                l.SetGraphicsRootShaderResourceView(param, address);
-                            }
+                            rec(list).set_root_view(point(compute), param, parameter::SRV, address);
                         }
                         continue;
                     }
@@ -1334,11 +1327,7 @@ impl State {
                             // SAFETY: an open list; the table lives as long
                             // as the heap the list holds.
                             Some(gpu) => unsafe {
-                                if compute {
-                                    l.SetComputeRootShaderResourceView(param, gpu);
-                                } else {
-                                    l.SetGraphicsRootShaderResourceView(param, gpu);
-                                }
+                                rec(list).set_root_view(point(compute), param, parameter::SRV, gpu)
                             },
                             None => once!("a shader picks buffers from a view heap that is not set"),
                         }
@@ -1379,14 +1368,8 @@ impl State {
                         ));
                     }
                     // SAFETY: an open list; the address is in live memory.
-                    unsafe {
-                        match (compute, srv) {
-                            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
-                            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
-                            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
-                            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
-                        }
-                    }
+                    let kind = if srv { parameter::SRV } else { parameter::CBV };
+                    unsafe { rec(list).set_root_view(point(compute), param, kind, gpu) };
                 }
             }
             for &(slot, param) in &stage.root_uavs {
@@ -1395,13 +1378,7 @@ impl State {
                     if let Some(m) = &memory {
                         // SAFETY: an open list; the buffer lives as long as
                         // the process and the list holds it.
-                        unsafe {
-                            if compute {
-                                l.SetComputeRootUnorderedAccessView(param, m.faults);
-                            } else {
-                                l.SetGraphicsRootUnorderedAccessView(param, m.faults);
-                            }
-                        }
+                        unsafe { rec(list).set_root_view(point(compute), param, parameter::UAV, m.faults) };
                     }
                     continue;
                 }
@@ -1479,13 +1456,7 @@ impl State {
             let base = unsafe { s.buffer.GetGPUVirtualAddress() };
             let gpu = base + ((s.gpu(a) - base) & !15);
             // SAFETY: an open list; the address is in a live buffer.
-            unsafe {
-                if compute {
-                    list.list.SetComputeRootUnorderedAccessView(param, gpu);
-                } else {
-                    list.list.SetGraphicsRootUnorderedAccessView(param, gpu);
-                }
-            }
+            unsafe { rec(list).set_root_view(point(compute), param, parameter::UAV, gpu) };
             return true;
         }
         let heap = match self.heaps[0] {
@@ -1531,13 +1502,7 @@ impl State {
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        unsafe { rec(list).set_root_table(point(compute), param, handle.ptr) };
         true
     }
 
@@ -1615,13 +1580,7 @@ impl State {
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
-        unsafe {
-            if compute {
-                list.list.SetComputeRootDescriptorTable(param, handle);
-            } else {
-                list.list.SetGraphicsRootDescriptorTable(param, handle);
-            }
-        }
+        unsafe { rec(list).set_root_table(point(compute), param, handle.ptr) };
         true
     }
 
@@ -2424,7 +2383,7 @@ impl State {
             if let Some((param, word, width)) = tail {
                 let left = threads[0] - base * width;
                 // SAFETY: the translated shader declares this root word.
-                unsafe { list.list.SetComputeRoot32BitConstant(param, left, word) };
+                unsafe { rec(list).set_root_constants(Point::Compute, param, word, &[left]) };
             }
         };
         match group_base(p) {
@@ -2436,23 +2395,23 @@ impl State {
                     let mut base = 0;
                     while base < x {
                         set_tail(base);
-                        list.list.SetComputeRoot32BitConstant(param, base, dword);
+                        rec(list).set_root_constants(Point::Compute, param, dword, &[base]);
                         let count = (x - base).min(crate::indirect::PART);
-                        list.list.Dispatch(count, y, z);
+                        rec(list).dispatch_groups([count, y, z]);
                         base += count;
                     }
-                    list.list.SetComputeRoot32BitConstant(param, 0, dword);
+                    rec(list).set_root_constants(Point::Compute, param, dword, &[0]);
                 }
             }
             // SAFETY: an open list with everything set.
             _ => {
                 set_tail(0);
-                unsafe { list.list.Dispatch(x, y, z) };
+                unsafe { rec(list).dispatch_groups([x, y, z]) };
             }
         }
         if let Some((param, word, _)) = tail {
             // Later ordinary or indirect dispatches use all lanes.
-            unsafe { list.list.SetComputeRoot32BitConstant(param, 0, word) };
+            unsafe { rec(list).set_root_constants(Point::Compute, param, word, &[0]) };
         }
         #[cfg(feature = "diagnostics")]
         crate::memory::ray_probe::after_dispatch(list, p);
@@ -2763,12 +2722,12 @@ impl State {
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
-                Ok(l6) => {
+                Ok(_) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { rec(list).dispatch_mesh_groups([x, 1, 1]) };
                     self.mesh_scissor(list, false);
                     #[cfg(feature = "diagnostics")]
                     self.dump_after(list);
@@ -3185,10 +3144,7 @@ impl State {
                 viewports(list, &[viewport]);
             }
             // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawInstanced(count, instances, from, first_instance)
-            };
+            unsafe { rec(list).draw_instanced(count, instances, from, first_instance) };
             if frontend.is_some() {
                 viewports(list, &self.viewports);
             }
@@ -3307,13 +3263,13 @@ impl State {
                 };
                 crate::primitive::expand_rects(src, dst, stride, &elements);
             });
-            let view = D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: gpu,
-                SizeInBytes: (rects * 6 * stride as u64) as u32,
-                StrideInBytes: v.stride,
+            let view = victory_host::VertexView {
+                address: gpu,
+                size: (rects * 6 * stride as u64) as u32,
+                stride: v.stride,
             };
             // SAFETY: an open list; the view names live scratch memory.
-            unsafe { list.list.IASetVertexBuffers(slot, Some(&[view])) };
+            unsafe { rec(list).set_vertex_buffers(slot, &[view]) };
         }
         true
     }
@@ -3342,10 +3298,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
-            unsafe {
-                list.list
-                    .DrawIndexedInstanced(indices, instances, first, base, first_instance)
-            };
+            unsafe { rec(list).draw_indexed_instanced(indices, instances, first, base, first_instance) };
             #[cfg(feature = "diagnostics")]
             self.dump_after(list);
             DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -4026,25 +3979,38 @@ const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    let v: Vec<victory_host::Viewport> = viewports
+        .iter()
+        .map(|v| victory_host::Viewport {
+            x: v.TopLeftX,
+            y: v.TopLeftY,
+            width: v.Width,
+            height: v.Height,
+            min_depth: v.MinDepth,
+            max_depth: v.MaxDepth,
+        })
+        .collect();
     // SAFETY: an open list.
-    unsafe { list.list.RSSetViewports(viewports) };
+    unsafe { rec(list).set_viewports(&v) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    let r: Vec<victory_host::Rect> = rects.iter().map(|r| [r.left, r.top, r.right, r.bottom]).collect();
     // SAFETY: an open list.
-    unsafe { list.list.RSSetScissorRects(rects) };
+    unsafe { rec(list).set_scissors(&r) };
 }
 
+/// D3D12 takes no factor as opaque white's (1, 1, 1, 1).
 pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
     // SAFETY: an open list.
-    unsafe { list.list.OMSetBlendFactor(factor) };
+    unsafe { rec(list).set_blend_factor(factor.copied().unwrap_or([1.0; 4])) };
 }
 
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     #[cfg(feature = "diagnostics")]
     crate::capture::op(std::ptr::from_ref(list) as usize, || format!("STENCIL REF {reference:#x}"));
     // SAFETY: an open list.
-    unsafe { list.list.OMSetStencilRef(reference) };
+    unsafe { rec(list).set_stencil_ref(reference) };
 }
 
 pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
@@ -4052,11 +4018,9 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     crate::capture::op(std::ptr::from_ref(list) as usize, || {
         format!("DEPTH BOUNDS {min}..{max}")
     });
-    if crate::host::host().is_some_and(|h| h.depth_bounds())
-        && let Ok(l1) = list.list.cast::<ID3D12GraphicsCommandList1>()
-    {
+    if crate::host::host().is_some_and(|h| h.depth_bounds()) {
         // SAFETY: an open list on a device that supports depth bounds.
-        unsafe { l1.OMSetDepthBounds(min, max) };
+        unsafe { rec(list).set_depth_bounds(min, max) };
     }
 }
 

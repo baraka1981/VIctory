@@ -408,8 +408,8 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
-    pub(crate) pso: ID3D12PipelineState,
-    pub(crate) root: ID3D12RootSignature,
+    /// The host pipeline and its root signature, as the backend made them.
+    pub(crate) host: crate::backend::D3d12Pipeline,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
     /// The vertex buffer slots it reads (bit per slot).
@@ -599,8 +599,8 @@ impl HostPipeline {
                 threads: [0; 3],
                 cache: Some(&name),
             });
-            let (pso, root) = match made {
-                Ok(p) => (p.state, p.root),
+            let made = match made {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -608,12 +608,11 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.state, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
-                pso,
-                root,
+                host: made,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -665,8 +664,8 @@ impl HostPipeline {
                 depth_bounds,
                 &name,
             );
-            let (pso, root) = match made {
-                Ok(p) => (p.state, p.root),
+            let made = match made {
+                Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
@@ -674,12 +673,11 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
-            crate::host::name(&pso, || format!("{shaders:?}"));
+            crate::host::name(&made.state, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
-                pso,
-                root,
+                host: made,
                 stages: bound,
                 name: format!("{shaders:?}"),
                 slots: 0,
@@ -743,8 +741,8 @@ impl HostPipeline {
             rect_gs = None;
             made = make(None);
         }
-        let (pso, root) = match made {
-            Some(p) => (p.state, p.root),
+        let made = match made {
+            Some(p) => p,
             None => {
                 tracing::warn!(?shaders, "host pipeline refused");
                 host.log_messages();
@@ -752,7 +750,7 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
-        crate::host::name(&pso, || format!("{shaders:?}"));
+        crate::host::name(&made.state, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
             depth = ?g.depth,
@@ -766,8 +764,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
-            pso,
-            root,
+            host: made,
             stages: bound,
             name: format!("{shaders:?}"),
             slots: g.slots(),
