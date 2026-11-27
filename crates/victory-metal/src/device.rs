@@ -1543,6 +1543,14 @@ mod tests {
             let locations = crate::irconverter::locations(&rs).expect("MSC takes the root signature");
             eprintln!("{name}: ours {:?}", top.entries);
             let mut matched = 0;
+            // MSC reports tables with no register (space and slot
+            // 0xffffffff), in parameter order: matched by position.
+            let mut table_params = rs
+                .parameters
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| matches!(p.kind, Kind::Table(_)))
+                .map(|(i, _)| i);
             for l in &locations {
                 eprintln!(
                     "{name}: MSC {:?} space {} slot {} at {} ({} bytes)",
@@ -1557,7 +1565,10 @@ mod tests {
                     T::Table => (None, None),
                     _ => (None, None),
                 };
-                let found = rs.parameters.iter().position(|p| match &p.kind {
+                let found = if l.resourceType == T::Table {
+                    table_params.next()
+                } else {
+                    rs.parameters.iter().position(|p| match &p.kind {
                     Kind::Constants { register, space, .. } => {
                         param_ty == Some(parameter::CONSTANTS)
                             && (*register, *space) == (l.slot, l.space)
@@ -1565,16 +1576,11 @@ mod tests {
                     Kind::Descriptor { kind, register, space, .. } => {
                         param_ty == Some(*kind) && (*register, *space) == (l.slot, l.space)
                     }
-                    Kind::Table(ranges) => {
-                        l.resourceType == T::Table
-                            && ranges
-                                .first()
-                                .is_some_and(|r| (r.register, r.space) == (l.slot, l.space))
-                            || range_ty.is_some_and(|t| {
-                                ranges.iter().any(|r| covers(r, t, l.slot, l.space))
-                            })
-                    }
-                });
+                    Kind::Table(ranges) => range_ty.is_some_and(|t| {
+                        ranges.iter().any(|r| covers(r, t, l.slot, l.space))
+                    }),
+                    })
+                };
                 let static_sampler = l.resourceType == T::Sampler
                     && rs.samplers.iter().any(|s| (s.register, s.space) == (l.slot, l.space));
                 match found {
