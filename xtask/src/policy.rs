@@ -27,6 +27,24 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-APACHE",
 ];
 
+/// Test shaders we compile ourselves (Metal Shader Converter's input on
+/// the Mac, which has no dxc): `<stem>.dxil` here passes only beside its
+/// source `<stem>.hlsl`, and only within the size limit.
+const COMPILED_FIXTURES: &str = "crates/victory-metal/tests/fixtures/";
+
+/// A `.dxil` fixture compiled from an `.hlsl` committed beside it.
+fn is_compiled_fixture(path: &str, files: &[String]) -> bool {
+    let Some(name) = path.strip_prefix(COMPILED_FIXTURES) else {
+        return false;
+    };
+    let Some(stem) = name.strip_suffix(".dxil") else {
+        return false;
+    };
+    !stem.is_empty()
+        && !stem.contains('/')
+        && files.iter().any(|f| *f == format!("{COMPILED_FIXTURES}{stem}.hlsl"))
+}
+
 /// Signatures of formats that must never be committed.
 const FORBIDDEN_MAGIC: &[(&[u8], &str)] = &[
     (b"MZ", "PE executable"),
@@ -61,6 +79,18 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
                 Err(_) => continue,
             }
         };
+        // A staged-only list may lack the source: then it must be on disk.
+        let source = path.strip_suffix(".dxil").map(|stem| format!("{stem}.hlsl"));
+        let fixture = is_compiled_fixture(path, &files)
+            || source.as_ref().is_some_and(|s| {
+                root.join(s).is_file() && is_compiled_fixture(path, std::slice::from_ref(s))
+            });
+        if fixture {
+            if content.len() > MAX_FILE_SIZE {
+                violations.push(format!("{path}: compiled fixture over {MAX_FILE_SIZE} bytes"));
+            }
+            continue;
+        }
         for problem in check(path, &content) {
             violations.push(format!("{path}: {problem}"));
         }
@@ -204,6 +234,34 @@ mod tests {
             !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
             "too big"
         );
+    }
+
+    #[test]
+    fn compiled_fixtures_need_their_source() {
+        use super::is_compiled_fixture;
+        let files = |names: &[&str]| -> Vec<String> {
+            names
+                .iter()
+                .map(|n| format!("crates/victory-metal/tests/fixtures/{n}"))
+                .collect()
+        };
+        let with_source = files(&["add.hlsl", "add.dxil"]);
+        assert!(is_compiled_fixture(
+            "crates/victory-metal/tests/fixtures/add.dxil",
+            &with_source
+        ));
+        assert!(!is_compiled_fixture(
+            "crates/victory-metal/tests/fixtures/add.dxil",
+            &files(&["add.dxil"])
+        ));
+        assert!(!is_compiled_fixture(
+            "crates/victory-gpu/tests/add.dxil",
+            &with_source
+        ));
+        assert!(!is_compiled_fixture(
+            "crates/victory-metal/tests/fixtures/add.dds",
+            &with_source
+        ));
     }
 
     #[test]
