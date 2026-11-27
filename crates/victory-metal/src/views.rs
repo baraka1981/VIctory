@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::Mutex;
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, Weak};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_metal::{
@@ -46,6 +46,36 @@ pub struct Target {
     pub texture: Texture,
     pub level: usize,
     pub slice: usize,
+}
+
+/// Buffers made by a device, by GPU address (weakly held), for addresses
+/// given as numbers: constant views, root views, vertex and index views.
+#[derive(Default)]
+pub(crate) struct Buffers(Mutex<BTreeMap<u64, (u64, Weak<ProtocolObject<dyn MTLBuffer>>)>>);
+
+impl Buffers {
+    /// Notes a new buffer's GPU range (dropping entries whose buffers are
+    /// gone now and then).
+    pub(crate) fn remember(&self, buffer: &Buffer) {
+        let mut all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        all.insert(
+            buffer.gpuAddress(),
+            (buffer.length() as u64, Weak::from_retained(buffer)),
+        );
+        if all.len().is_multiple_of(1024) {
+            all.retain(|_, (_, b)| b.load().is_some());
+        }
+    }
+
+    /// The live buffer that holds GPU `address`.
+    pub(crate) fn at(&self, address: u64) -> Option<Buffer> {
+        let all = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (start, (len, b)) = all.range(..=address).next_back()?;
+        if address >= start + len {
+            return None;
+        }
+        b.load()
+    }
 }
 
 /// What a slot names: kept alive while it does.

@@ -56,7 +56,25 @@ pub struct TopLevel {
     /// Where the static samplers' table address goes, if there are any.
     pub statics: Option<u32>,
     pub bytes: u32,
+    /// The root signature's flags (`D3D12_ROOT_SIGNATURE_FLAGS`).
+    pub flags: u32,
 }
+
+/// One root parameter's argument, as state-setting recording leaves it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Arg {
+    /// Not set: zeros.
+    #[default]
+    None,
+    /// Root constants (from value 0).
+    Constants(Vec<u32>),
+    /// A root descriptor's GPU address, or a table's first entry's.
+    Address(u64),
+}
+
+/// `CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, `SAMPLER_HEAP_DIRECTLY_INDEXED`.
+pub const VIEWS_DIRECTLY_INDEXED: u32 = 0x400;
+pub const SAMPLERS_DIRECTLY_INDEXED: u32 = 0x800;
 
 impl TopLevel {
     pub fn new(rs: &RootSignature) -> Result<TopLevel, RootError> {
@@ -96,6 +114,7 @@ impl TopLevel {
             tables,
             statics,
             bytes: at.next_multiple_of(8),
+            flags: rs.flags,
         })
     }
 
@@ -158,6 +177,32 @@ impl TopLevel {
                     let v = t.next().copied().unwrap_or(0);
                     out[at..at + 8].copy_from_slice(&v.to_le_bytes());
                 }
+            }
+        }
+        if let Some(at) = self.statics {
+            let at = at as usize;
+            out[at..at + 8].copy_from_slice(&statics.to_le_bytes());
+        }
+        out
+    }
+
+    /// The buffer from one argument per root parameter (by parameter
+    /// index; missing or mismatched ones read as zeros) and the static
+    /// samplers' table address.
+    pub fn fill_args(&self, args: &[Arg], statics: u64) -> Vec<u8> {
+        let mut out = vec![0u8; self.bytes.max(8) as usize];
+        for (e, arg) in self.entries.iter().zip(args) {
+            let at = e.offset as usize;
+            match (e.slot, arg) {
+                (Slot::Constants(n), Arg::Constants(values)) => {
+                    for (i, v) in values.iter().take(n as usize).enumerate() {
+                        out[at + i * 4..at + i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                    }
+                }
+                (Slot::Descriptor(_) | Slot::Table, &Arg::Address(a)) => {
+                    out[at..at + 8].copy_from_slice(&a.to_le_bytes());
+                }
+                _ => {}
             }
         }
         if let Some(at) = self.statics {
@@ -354,6 +399,29 @@ mod tests {
         assert_eq!((top.statics, top.bytes), (Some(16), 24));
         let ab = top.fill(&[1, 2, 3], &[], &[], 0xabc);
         assert_eq!(&ab[16..24], &0xabcu64.to_le_bytes());
+    }
+
+    #[test]
+    fn arguments_by_parameter_fill_the_same_buffer() {
+        // RS10 by parameter: constants, CBV, SRV, (UAV unset), table, table.
+        let top = TopLevel::new(&root::parse(&samples::RS10).unwrap()).unwrap();
+        let args = [
+            Arg::Constants(vec![1, 2, 3]),
+            Arg::Address(0xa),
+            Arg::Address(0xb),
+            Arg::None,
+            Arg::Address(0x7000),
+            // A mismatched argument reads as zeros.
+            Arg::Constants(vec![9]),
+        ];
+        assert_eq!(
+            top.fill_args(&args, 0x9000),
+            top.fill(&[1, 2, 3], &[0xa, 0xb, 0], &[0x7000, 0], 0x9000)
+        );
+        assert_eq!(top.flags, 1);
+        // Fewer constants than the parameter has: the rest stay zero.
+        let short = top.fill_args(&[Arg::Constants(vec![5])], 0);
+        assert_eq!(&short[0..12], &[5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

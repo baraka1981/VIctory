@@ -5,7 +5,7 @@
 //! device API, which a Metal backend then replaces.
 
 use victory_host::{
-    Arguments, Binding, ComputeDesc, Draw, GraphicsDesc, Pass, ShaderCode, Vertices,
+    Arguments, Binding, ComputeDesc, Draw, GraphicsDesc, Pass, Point, ShaderCode, Vertices,
     Barrier, Footprint, Location, Recorder, Region,
     Allocation, ClearValue, DepthViewDesc, Descriptors, Device, HeapUse, Memory, ResourceDesc,
     SamplerDesc, ShaderViewDesc, TargetViewDesc, UnorderedViewDesc,
@@ -403,6 +403,13 @@ impl D3d12List<'_> {
     }
 }
 
+fn rects_of(rects: &[victory_host::Rect]) -> Vec<windows::Win32::Foundation::RECT> {
+    rects
+        .iter()
+        .map(|&[left, top, right, bottom]| windows::Win32::Foundation::RECT { left, top, right, bottom })
+        .collect()
+}
+
 impl Recorder for D3d12List<'_> {
     type Resource = ID3D12Resource;
     type Pipeline = D3d12Pipeline;
@@ -487,6 +494,194 @@ impl Recorder for D3d12List<'_> {
             self.root_arguments(pipeline, arguments, true);
             self.pass(pass);
             l6.DispatchMesh(groups[0], groups[1], groups[2]);
+        }
+    }
+
+    unsafe fn set_heaps(&self, heaps: &[&ID3D12DescriptorHeap]) {
+        let heaps: Vec<Option<ID3D12DescriptorHeap>> = heaps.iter().map(|h| Some((*h).clone())).collect();
+        // SAFETY: the caller's open list and shader-visible heaps.
+        unsafe { self.0.SetDescriptorHeaps(&heaps) };
+    }
+
+    unsafe fn set_compute_root(&self, pipeline: &D3d12Pipeline) {
+        // SAFETY: the caller's.
+        unsafe { self.0.SetComputeRootSignature(&pipeline.root) };
+    }
+
+    unsafe fn set_graphics_root(&self, pipeline: &D3d12Pipeline) {
+        // SAFETY: the caller's.
+        unsafe { self.0.SetGraphicsRootSignature(&pipeline.root) };
+    }
+
+    unsafe fn set_compute_pipeline(&self, pipeline: &D3d12Pipeline) {
+        // SAFETY: the caller's.
+        unsafe { self.0.SetPipelineState(&pipeline.state) };
+    }
+
+    unsafe fn set_graphics_pipeline(&self, pipeline: &D3d12Pipeline) {
+        // SAFETY: the caller's.
+        unsafe { self.0.SetPipelineState(&pipeline.state) };
+    }
+
+    unsafe fn set_root_constants(&self, point: Point, param: u32, offset: u32, values: &[u32]) {
+        let (n, data) = (values.len() as u32, values.as_ptr().cast());
+        // SAFETY: the caller's; `values` covers `n` words.
+        unsafe {
+            match point {
+                Point::Compute => self.0.SetComputeRoot32BitConstants(param, n, data, offset),
+                Point::Graphics => self.0.SetGraphicsRoot32BitConstants(param, n, data, offset),
+            }
+        }
+    }
+
+    unsafe fn set_root_view(&self, point: Point, param: u32, kind: u32, address: u64) {
+        use victory_host::root::parameter;
+        // SAFETY: the caller's.
+        unsafe {
+            match (point, kind) {
+                (Point::Compute, parameter::CBV) => self.0.SetComputeRootConstantBufferView(param, address),
+                (Point::Compute, parameter::UAV) => self.0.SetComputeRootUnorderedAccessView(param, address),
+                (Point::Compute, _) => self.0.SetComputeRootShaderResourceView(param, address),
+                (Point::Graphics, parameter::CBV) => self.0.SetGraphicsRootConstantBufferView(param, address),
+                (Point::Graphics, parameter::UAV) => self.0.SetGraphicsRootUnorderedAccessView(param, address),
+                (Point::Graphics, _) => self.0.SetGraphicsRootShaderResourceView(param, address),
+            }
+        }
+    }
+
+    unsafe fn set_root_table(&self, point: Point, param: u32, handle: u64) {
+        let handle = windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE { ptr: handle };
+        // SAFETY: the caller's.
+        unsafe {
+            match point {
+                Point::Compute => self.0.SetComputeRootDescriptorTable(param, handle),
+                Point::Graphics => self.0.SetGraphicsRootDescriptorTable(param, handle),
+            }
+        }
+    }
+
+    unsafe fn set_targets(&self, targets: &[usize], depth: Option<usize>) {
+        let rtvs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = targets.iter().map(|&ptr| D3D12_CPU_DESCRIPTOR_HANDLE { ptr }).collect();
+        let dsv = depth.map(|ptr| D3D12_CPU_DESCRIPTOR_HANDLE { ptr });
+        // SAFETY: the caller's.
+        unsafe {
+            self.0.OMSetRenderTargets(
+                rtvs.len() as u32,
+                (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
+                false,
+                dsv.as_ref().map(std::ptr::from_ref),
+            )
+        };
+    }
+
+    unsafe fn clear_target(&self, at: usize, rgba: [f32; 4], rects: &[victory_host::Rect]) {
+        let rects = rects_of(rects);
+        // SAFETY: the caller's.
+        unsafe {
+            self.0.ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at }, &rgba, (!rects.is_empty()).then_some(&rects[..]))
+        };
+    }
+
+    unsafe fn clear_depth(&self, at: usize, depth: Option<f32>, stencil: Option<u8>, rects: &[victory_host::Rect]) {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_CLEAR_FLAGS, D3D12_CLEAR_FLAG_DEPTH, D3D12_CLEAR_FLAG_STENCIL};
+        let mut flags = D3D12_CLEAR_FLAGS(0);
+        if depth.is_some() {
+            flags |= D3D12_CLEAR_FLAG_DEPTH;
+        }
+        if stencil.is_some() {
+            flags |= D3D12_CLEAR_FLAG_STENCIL;
+        }
+        let rects = rects_of(rects);
+        // SAFETY: the caller's.
+        unsafe {
+            self.0.ClearDepthStencilView(
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at },
+                flags,
+                depth.unwrap_or(0.0),
+                stencil.unwrap_or(0),
+                (!rects.is_empty()).then_some(&rects[..]),
+            )
+        };
+    }
+
+    unsafe fn set_viewports(&self, viewports: &[victory_host::Viewport]) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
+        let v: Vec<D3D12_VIEWPORT> = viewports
+            .iter()
+            .map(|v| D3D12_VIEWPORT { TopLeftX: v.x, TopLeftY: v.y, Width: v.width, Height: v.height, MinDepth: v.min_depth, MaxDepth: v.max_depth })
+            .collect();
+        // SAFETY: the caller's.
+        unsafe { self.0.RSSetViewports(&v) };
+    }
+
+    unsafe fn set_scissors(&self, rects: &[victory_host::Rect]) {
+        // SAFETY: the caller's.
+        unsafe { self.0.RSSetScissorRects(&rects_of(rects)) };
+    }
+
+    unsafe fn set_blend_factor(&self, rgba: [f32; 4]) {
+        // SAFETY: the caller's.
+        unsafe { self.0.OMSetBlendFactor(Some(&rgba)) };
+    }
+
+    unsafe fn set_stencil_ref(&self, reference: u32) {
+        // SAFETY: the caller's.
+        unsafe { self.0.OMSetStencilRef(reference) };
+    }
+
+    unsafe fn set_depth_bounds(&self, min: f32, max: f32) {
+        use windows::core::Interface;
+        if let Ok(l1) = self.0.cast::<windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList1>() {
+            // SAFETY: the caller's (a device with depth bounds).
+            unsafe { l1.OMSetDepthBounds(min, max) };
+        }
+    }
+
+    unsafe fn set_topology(&self, topology: u32) {
+        // SAFETY: the caller's.
+        unsafe {
+            self.0.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(topology as i32))
+        };
+    }
+
+    unsafe fn set_vertex_buffers(&self, first: u32, views: &[victory_host::VertexView]) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_VERTEX_BUFFER_VIEW;
+        let v: Vec<D3D12_VERTEX_BUFFER_VIEW> = views
+            .iter()
+            .map(|v| D3D12_VERTEX_BUFFER_VIEW { BufferLocation: v.address, SizeInBytes: v.size, StrideInBytes: v.stride })
+            .collect();
+        // SAFETY: the caller's.
+        unsafe { self.0.IASetVertexBuffers(first, Some(&v)) };
+    }
+
+    unsafe fn set_index_buffer(&self, view: Option<victory_host::IndexView>) {
+        use windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_VIEW;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let v = view.map(|v| D3D12_INDEX_BUFFER_VIEW { BufferLocation: v.address, SizeInBytes: v.size, Format: DXGI_FORMAT(v.format as i32) });
+        // SAFETY: the caller's.
+        unsafe { self.0.IASetIndexBuffer(v.as_ref().map(std::ptr::from_ref)) };
+    }
+
+    unsafe fn draw_instanced(&self, count: u32, instances: u32, first: u32, first_instance: u32) {
+        // SAFETY: the caller's.
+        unsafe { self.0.DrawInstanced(count, instances, first, first_instance) };
+    }
+
+    unsafe fn draw_indexed_instanced(&self, count: u32, instances: u32, first: u32, base_vertex: i32, first_instance: u32) {
+        // SAFETY: the caller's.
+        unsafe { self.0.DrawIndexedInstanced(count, instances, first, base_vertex, first_instance) };
+    }
+
+    unsafe fn dispatch_groups(&self, groups: [u32; 3]) {
+        // SAFETY: the caller's.
+        unsafe { self.0.Dispatch(groups[0], groups[1], groups[2]) };
+    }
+
+    unsafe fn dispatch_mesh_groups(&self, groups: [u32; 3]) {
+        use windows::core::Interface;
+        if let Ok(l6) = self.0.cast::<windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList6>() {
+            // SAFETY: the caller's.
+            unsafe { l6.DispatchMesh(groups[0], groups[1], groups[2]) };
         }
     }
 
@@ -743,6 +938,16 @@ impl Device for D3d12<'_> {
     fn descriptor_start(&self, heap: &ID3D12DescriptorHeap) -> usize {
         // SAFETY: a live heap.
         unsafe { heap.GetCPUDescriptorHandleForHeapStart() }.ptr
+    }
+
+    fn descriptor_gpu_start(&self, heap: &ID3D12DescriptorHeap) -> u64 {
+        // SAFETY: a live shader-visible heap.
+        unsafe { heap.GetGPUDescriptorHandleForHeapStart() }.ptr
+    }
+
+    fn gpu_address(&self, buffer: &ID3D12Resource) -> u64 {
+        // SAFETY: a live buffer.
+        unsafe { buffer.GetGPUVirtualAddress() }
     }
 
     unsafe fn shader_view(

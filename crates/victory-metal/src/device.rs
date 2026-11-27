@@ -4,10 +4,9 @@
 //! and are ignored; clear values belong to Metal render passes and are
 //! ignored here too.
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use objc2::rc::{Retained, Weak};
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSString, NSURL};
 use objc2_metal::{
@@ -25,7 +24,7 @@ use victory_host::{
 use crate::record::MetalRecorder;
 use crate::render::MetalGraphicsPipeline;
 use crate::toplevel::TopLevel;
-use crate::views::{self, Kept, Slots, Target, resource_id};
+use crate::views::{self, Buffers, Kept, Slots, Target, resource_id};
 use crate::{DESCRIPTOR_BYTES, MetalError, format, layout};
 
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -88,9 +87,9 @@ pub struct MetalDevice {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     /// Metal objects descriptor slots refer to, by slot address.
     slots: Arc<Slots>,
-    /// Buffers made here, by GPU address, for constant views (which name
-    /// an address, not a buffer).
-    buffers: Mutex<BTreeMap<u64, (u64, Weak<ProtocolObject<dyn MTLBuffer>>)>>,
+    /// Buffers made here, by GPU address, for addresses given as numbers
+    /// (constant views here, root / vertex / index views when recording).
+    buffers: Arc<Buffers>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 }
 
@@ -104,7 +103,7 @@ impl MetalDevice {
         Ok(MetalDevice {
             device,
             slots: Arc::default(),
-            buffers: Mutex::default(),
+            buffers: Arc::default(),
             queue,
         })
     }
@@ -115,7 +114,7 @@ impl MetalDevice {
             .queue
             .commandBuffer()
             .ok_or(MetalError::Failed("a command buffer"))?;
-        Ok(MetalRecorder::new(buffer, self.slots.clone()))
+        Ok(MetalRecorder::new(buffer, self.slots.clone(), self.buffers.clone()))
     }
 
     pub fn raw(&self) -> &ProtocolObject<dyn MTLDevice> {
@@ -139,27 +138,12 @@ impl MetalDevice {
         unsafe { views::write(at, words) }
     }
 
-    /// Notes a new buffer's GPU range (dropping entries whose buffers are
-    /// gone now and then).
     fn remember(&self, buffer: &Buffer) {
-        let mut all = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        all.insert(
-            buffer.gpuAddress(),
-            (buffer.length() as u64, Weak::from_retained(buffer)),
-        );
-        if all.len().is_multiple_of(1024) {
-            all.retain(|_, (_, b)| b.load().is_some());
-        }
+        self.buffers.remember(buffer);
     }
 
-    /// The live buffer made here that holds GPU `address`.
     fn buffer_at(&self, address: u64) -> Option<Buffer> {
-        let all = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
-        let (start, (len, b)) = all.range(..=address).next_back()?;
-        if address >= start + len {
-            return None;
-        }
-        b.load()
+        self.buffers.at(address)
     }
 
     /// `rs`'s static samplers as a table of sampler entries (`None` when
@@ -570,6 +554,19 @@ impl Device for MetalDevice {
 
     fn descriptor_start(&self, heap: &MetalDescriptorHeap) -> usize {
         heap.table.contents().as_ptr() as usize
+    }
+
+    /// Our descriptor tables are what converted shaders read: a slot's
+    /// GPU handle is its address in the table buffer.
+    fn descriptor_gpu_start(&self, heap: &MetalDescriptorHeap) -> u64 {
+        heap.table.gpuAddress()
+    }
+
+    fn gpu_address(&self, buffer: &MetalResource) -> u64 {
+        match buffer {
+            MetalResource::Buffer(b) => b.gpuAddress(),
+            MetalResource::Texture(_) => 0,
+        }
     }
 
     unsafe fn shader_view(

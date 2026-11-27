@@ -725,6 +725,33 @@ impl<R> Clone for Barrier<'_, R> {
 }
 impl<R> Copy for Barrier<'_, R> {}
 
+/// Which root signature a root argument goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Point {
+    Compute,
+    Graphics,
+}
+
+/// A vertex buffer by GPU address (`D3D12_VERTEX_BUFFER_VIEW`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VertexView {
+    pub address: u64,
+    pub size: u32,
+    pub stride: u32,
+}
+
+/// An index buffer by GPU address (`D3D12_INDEX_BUFFER_VIEW`): `format`
+/// is DXGI's R16_UINT (57) or R32_UINT (42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexView {
+    pub address: u64,
+    pub size: u32,
+    pub format: u32,
+}
+
+/// A rectangle (`D3D12_RECT`): left, top, right, bottom.
+pub type Rect = [i32; 4];
+
 /// Recording into one open command list (slice 2a: barriers and copies).
 /// Methods are unsafe: the caller keeps the list open and every resource
 /// alive until the list has run, and ranges inside their resources.
@@ -774,6 +801,160 @@ pub trait Recorder {
         arguments: &Arguments<'_, Self::Resource, Self::DescriptorHeap>,
         groups: [u32; 3],
     );
+
+    // D3D12-style state setting (slice 2b), for recording that sets state
+    // as it goes and draws with what is set, as victory-gpu's lists do.
+    // Addresses and descriptor handles are numbers: GPU addresses
+    // ([`Device::gpu_address`] plus an offset) and GPU descriptor handles
+    // ([`Device::descriptor_gpu_start`] plus `index * step`). Root
+    // arguments go to the root signature last set at their [`Point`],
+    // by parameter index. Every method: the list is open, and everything
+    // named stays alive until the list has run.
+
+    /// The shader-visible heaps tables and directly indexed shaders use
+    /// (one view heap, one sampler heap at most).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn set_heaps(&self, heaps: &[&Self::DescriptorHeap]);
+
+    /// A compute pipeline's root signature (root arguments set before it
+    /// are forgotten).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn set_compute_root(&self, pipeline: &Self::Pipeline);
+
+    /// A graphics pipeline's root signature (as above).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn set_graphics_root(&self, pipeline: &Self::GraphicsPipeline);
+
+    /// The compute pipeline dispatches run.
+    ///
+    /// # Safety
+    /// See above; its root signature is the one set.
+    unsafe fn set_compute_pipeline(&self, pipeline: &Self::Pipeline);
+
+    /// The graphics pipeline draws run.
+    ///
+    /// # Safety
+    /// See above; its root signature is the one set.
+    unsafe fn set_graphics_pipeline(&self, pipeline: &Self::GraphicsPipeline);
+
+    /// `values` into root constants parameter `param`, from 32-bit value
+    /// `offset`.
+    ///
+    /// # Safety
+    /// See above; `param` is a constants parameter of the root signature
+    /// set at `point`, the values inside it.
+    unsafe fn set_root_constants(&self, point: Point, param: u32, offset: u32, values: &[u32]);
+
+    /// The GPU address root descriptor parameter `param` reads; `kind` is
+    /// its type (`root::parameter`: CBV, SRV or UAV), as D3D12 sets each
+    /// kind its own way.
+    ///
+    /// # Safety
+    /// See above; `param` is a root descriptor of `kind` of that root
+    /// signature, and the address is in a live buffer.
+    unsafe fn set_root_view(&self, point: Point, param: u32, kind: u32, address: u64);
+
+    /// The GPU descriptor handle a descriptor table parameter starts at.
+    ///
+    /// # Safety
+    /// See above; the handle is in a heap set with [`Recorder::set_heaps`].
+    unsafe fn set_root_table(&self, point: Point, param: u32, handle: u64);
+
+    /// Render targets and depth target, by view slot (CPU addresses as
+    /// [`Device::target_view`] / [`Device::depth_view`] write them).
+    ///
+    /// # Safety
+    /// See above; the slots hold live views.
+    unsafe fn set_targets(&self, targets: &[usize], depth: Option<usize>);
+
+    /// Clears the target view at slot `at` to `rgba` (all of it with no
+    /// `rects`).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn clear_target(&self, at: usize, rgba: [f32; 4], rects: &[Rect]);
+
+    /// Clears the depth view at slot `at`: depth and/or stencil.
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn clear_depth(&self, at: usize, depth: Option<f32>, stencil: Option<u8>, rects: &[Rect]);
+
+    /// # Safety
+    /// See above.
+    unsafe fn set_viewports(&self, viewports: &[Viewport]);
+
+    /// # Safety
+    /// See above.
+    unsafe fn set_scissors(&self, rects: &[Rect]);
+
+    /// # Safety
+    /// See above.
+    unsafe fn set_blend_factor(&self, rgba: [f32; 4]);
+
+    /// # Safety
+    /// See above.
+    unsafe fn set_stencil_ref(&self, reference: u32);
+
+    /// Bounds for pipelines with the depth bounds test (where the host
+    /// has one).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn set_depth_bounds(&self, min: f32, max: f32);
+
+    /// `D3D_PRIMITIVE_TOPOLOGY` (as [`Vertices::primitive`]).
+    ///
+    /// # Safety
+    /// See above.
+    unsafe fn set_topology(&self, topology: u32);
+
+    /// Vertex buffers from slot `first`.
+    ///
+    /// # Safety
+    /// See above; the addresses are in live buffers.
+    unsafe fn set_vertex_buffers(&self, first: u32, views: &[VertexView]);
+
+    /// # Safety
+    /// See above; the address is in a live buffer.
+    unsafe fn set_index_buffer(&self, view: Option<IndexView>);
+
+    /// A draw with what is set (`DrawInstanced`).
+    ///
+    /// # Safety
+    /// See above; the set state covers what the draw reads.
+    unsafe fn draw_instanced(&self, count: u32, instances: u32, first: u32, first_instance: u32);
+
+    /// An indexed draw with what is set (`DrawIndexedInstanced`).
+    ///
+    /// # Safety
+    /// As for [`Recorder::draw_instanced`].
+    unsafe fn draw_indexed_instanced(
+        &self,
+        count: u32,
+        instances: u32,
+        first: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    );
+
+    /// A dispatch with what is set (`Dispatch`).
+    ///
+    /// # Safety
+    /// As for [`Recorder::draw_instanced`].
+    unsafe fn dispatch_groups(&self, groups: [u32; 3]);
+
+    /// A mesh dispatch with what is set (`DispatchMesh`).
+    ///
+    /// # Safety
+    /// As for [`Recorder::draw_instanced`].
+    unsafe fn dispatch_mesh_groups(&self, groups: [u32; 3]);
 
     /// # Safety
     /// See the trait.
@@ -886,6 +1067,14 @@ pub trait Device {
     /// The CPU address of `heap`'s first descriptor; slot `i` is at
     /// `start + i * step`. The view methods below write at such addresses.
     fn descriptor_start(&self, heap: &Self::DescriptorHeap) -> usize;
+
+    /// The GPU descriptor handle of a shader-visible `heap`'s first
+    /// descriptor; slot `i`'s is `start + i * step` (for
+    /// [`Recorder::set_root_table`]).
+    fn descriptor_gpu_start(&self, heap: &Self::DescriptorHeap) -> u64;
+
+    /// A buffer's GPU address (for root views and vertex / index views).
+    fn gpu_address(&self, buffer: &Self::Resource) -> u64;
 
     /// A shader resource view of `resource` at `at`; a null view (reads
     /// zeros) without one. With no `desc`, the whole resource as it is.
