@@ -980,6 +980,7 @@ mod tests {
                 entry: "add",
                 root_signature: &[],
                 threads: [64, 1, 1],
+                cache: None,
             })
             .expect("the shader compiles");
         let bytes = 256 * 4;
@@ -1046,6 +1047,7 @@ mod tests {
                 entry: "main",
                 root_signature: &[],
                 threads: [0; 3],
+                cache: None,
             })
             .expect("Metal Shader Converter converts the shader");
         assert_eq!(pipeline.threads, [64, 1, 1], "group size from reflection");
@@ -1113,6 +1115,7 @@ mod tests {
                 entry: "main",
                 root_signature: &rs,
                 threads: [0; 3],
+                cache: None,
             })
             .expect("Metal Shader Converter converts the shader");
         assert_eq!(pipeline.threads, [32, 1, 1], "group size from reflection");
@@ -1183,6 +1186,7 @@ mod tests {
                 entry: "main",
                 root_signature: &[],
                 threads: [0; 3],
+                cache: None,
             })
             .expect("Metal Shader Converter converts the shader");
         let offsets: Vec<u32> = pipeline.top.entries.iter().map(|e| e.offset).collect();
@@ -1612,6 +1616,7 @@ mod tests {
                 entry: "main",
                 root_signature: &[],
                 threads: [0; 3],
+                cache: None,
             })
             .expect("Metal Shader Converter converts the shader");
         assert!(pipeline.statics.is_some(), "a static sampler table");
@@ -1702,6 +1707,7 @@ mod tests {
                 entry: "main",
                 root_signature: &[],
                 threads: [0; 3],
+                cache: None,
             })
             .expect("Metal Shader Converter converts the shader");
         let desc = texture(4, 1, 28, 0);

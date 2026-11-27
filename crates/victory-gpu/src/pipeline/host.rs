@@ -515,13 +515,7 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
-        let (root, root_blob) = match root_signature(&host.device, params, samplers, compute.is_some()) {
-            Ok(root) => root,
-            Err(e) => {
-                tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
-            }
-        };
+        let root_blob = root_blob(params, samplers, compute.is_some());
         let code = |i: usize| {
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
@@ -532,22 +526,20 @@ impl HostPipeline {
             )
         };
         if compute.is_some() {
-            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                // SAFETY: a borrowed pointer the description never releases.
-                pRootSignature: unsafe { std::mem::transmute_copy(&root) },
-                CS: code(0),
-                ..Default::default()
-            };
-            let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
-            let made = super::library::pipeline(
-                &name,
-                // SAFETY: the description points at live data.
-                |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
-                // SAFETY: as above.
-                || unsafe { host.device.CreateComputePipelineState(&desc) },
-            );
-            let pso = match made {
-                Ok(pso) => pso,
+            // Through the host seam: the backend makes the root signature
+            // from the same bytes and caches the pipeline under the name.
+            use victory_host::Device as _;
+            let dxil = &stages[0].0.translated()?.host.dxil;
+            let name = super::library::name("compute", &root_blob, &[&dxil[..]], "");
+            let made = crate::backend::D3d12(&host.device).compute_pipeline(&victory_host::ComputeDesc {
+                code: victory_host::ShaderCode::Dxil(dxil),
+                entry: "main",
+                root_signature: &root_blob,
+                threads: [0; 3],
+                cache: Some(&name),
+            });
+            let (pso, root) = match made {
+                Ok(p) => (p.state, p.root),
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
@@ -571,6 +563,14 @@ impl HostPipeline {
         }
         let Some(g) = g else {
             return refuse("graphics state not kept (plain description)", shaders);
+        };
+        // SAFETY: a serialized root signature; D3D12 validates it.
+        let root: ID3D12RootSignature = match unsafe { host.device.CreateRootSignature(0, &root_blob) } {
+            Ok(root) => root,
+            Err(e) => {
+                tracing::warn!(error = %e, ?shaders, "host root signature refused");
+                return None;
+            }
         };
         let depth_bounds = if g.depth_bounds {
             if host.depth_bounds() {
@@ -940,15 +940,14 @@ fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) }.to_vec()
 }
 
-/// The host root signature of `params` and `samplers`: serialized by
+/// The host root signature of `params` and `samplers`, serialized by
 /// `victory_host::root` (byte for byte what D3D12's serializer returns,
-/// the container checksum included), and made on the device.
-fn root_signature(
-    device: &ID3D12Device,
+/// the container checksum included): what backends make it from.
+fn root_blob(
     params: Vec<victory_host::root::Parameter>,
     samplers: Vec<victory_host::root::StaticSampler>,
     compute: bool,
-) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+) -> Vec<u8> {
     let input = if compute {
         D3D12_ROOT_SIGNATURE_FLAG_NONE
     } else {
@@ -963,7 +962,18 @@ fn root_signature(
         parameters: params,
         samplers,
     };
-    let bytes = desc.serialize();
+    desc.serialize()
+}
+
+/// [`root_blob`], made on `device`.
+#[cfg(test)]
+fn root_signature(
+    device: &ID3D12Device,
+    params: Vec<victory_host::root::Parameter>,
+    samplers: Vec<victory_host::root::StaticSampler>,
+    compute: bool,
+) -> windows::core::Result<(ID3D12RootSignature, Vec<u8>)> {
+    let bytes = root_blob(params, samplers, compute);
     // SAFETY: a serialized root signature; D3D12 validates it.
     let root = unsafe { device.CreateRootSignature(0, &bytes) }?;
     Ok((root, bytes))

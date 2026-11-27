@@ -689,14 +689,24 @@ impl Device for D3d12<'_> {
         // one) and a DXIL container; D3D12 validates both.
         unsafe {
             let root: ID3D12RootSignature = self.0.CreateRootSignature(0, blob)?;
-            let state: ID3D12PipelineState = self.0.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::ManuallyDrop::new(Some(std::mem::transmute_copy(&root))),
+            let pso = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                // A borrowed pointer the description never releases.
+                pRootSignature: std::mem::transmute_copy(&root),
                 CS: D3D12_SHADER_BYTECODE {
                     pShaderBytecode: code.as_ptr().cast(),
                     BytecodeLength: code.len(),
                 },
                 ..Default::default()
-            })?;
+            };
+            let create = || self.0.CreateComputePipelineState(&pso);
+            let state: ID3D12PipelineState = match desc.cache {
+                Some(name) => crate::pipeline::library::pipeline(
+                    name,
+                    |library, name| library.LoadComputePipeline(name, &pso),
+                    create,
+                )?,
+                None => create()?,
+            };
             Ok(D3d12Pipeline { root, state, parameters })
         }
     }

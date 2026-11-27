@@ -336,6 +336,10 @@ pub struct ComputeDesc<'a> {
     pub root_signature: &'a [u8],
     /// Threads per group, as the shader declares them.
     pub threads: [u32; 3],
+    /// A name the backend may store the compiled pipeline under and load
+    /// it by next time (D3D12: the pipeline library), unique to the code,
+    /// root signature and state. `None`: compile every time.
+    pub cache: Option<&'a str>,
 }
 
 /// One shader stage: code and entry point.
