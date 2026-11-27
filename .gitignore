@@ -54,6 +54,8 @@
 *.ktx2
 *.dxbc
 *.dxil
+# Our own test shaders, compiled from the .hlsl beside them (not game assets).
+!crates/victory-metal/tests/fixtures/*.dxil
 *.cso
 *.spv
 *.wav
